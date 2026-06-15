@@ -1,0 +1,102 @@
+# =============================================================================
+# Terraform
+# =============================================================================
+# Local .terraform directories (provider plugins, module cache, backend config)
+**/.terraform/*
+.terraform.lock.hcl.bak
+
+# State files — NEVER commit. They contain secrets in plaintext (KV values,
+# connection strings, the storage access key) and are environment-specific.
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Variable files that may carry secrets. We commit *.tfvars.example templates only.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# CLI override files (used for local experimentation, not for the repo)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Saved plan output
+*.tfplan
+
+# Terraform CLI config that may include credentials
+.terraformrc
+terraform.rc
+
+# bootstrap.sh / destroy.sh temporarily park backend.tf under this name; if a run
+# is interrupted the sentinel may be left behind — never commit it.
+**/backend.tf.bootstrap-parked
+
+# =============================================================================
+# Kubernetes / Helm
+# =============================================================================
+# Fetched kubeconfigs — contain cluster admin credentials
+kubeconfig
+*.kubeconfig
+.kube/
+
+# Helm chart dependency archives and packaged charts
+**/charts/*.tgz
+**/Chart.lock
+
+# =============================================================================
+# Node.js (app-sample)
+# =============================================================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+coverage/
+.nyc_output/
+dist/
+build/
+
+# =============================================================================
+# Secrets & environment
+# =============================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+secrets.*
+*.secret
+
+# =============================================================================
+# OS / Editor / IDE
+# =============================================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# =============================================================================
+# Logs & temp
+# =============================================================================
+*.log
+tmp/
+.tmp/
+
+# =============================================================================
+# Local-only project files (kept on disk, never pushed)
+# =============================================================================
+# CLAUDE.md is the local project charter used by the editor/assistant for context.
+# Intentionally kept local — its content is mirrored into docs/ for the public repo.
+CLAUDE.md
+

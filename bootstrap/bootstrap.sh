@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+#
+# bootstrap.sh — run at the START of every KodeKloud (KK) Azure Playground session.
+#
+# WHAT THIS DOES (the "two-phase remote state" pattern):
+#   Phase 0  Preflight ........ verify tooling + Azure login, discover the KK resource group
+#   Phase 1  Local state ...... create ONLY the state storage account, tracked in LOCAL state
+#   Phase 2  Migrate .......... enable the azurerm remote backend, copy local state into it
+#   Phase 3  Full apply ....... provision the entire platform with state living in Azure
+#   Phase 4  Post-apply ....... pull AKS kubeconfig so kubectl/helm work in this session
+#
+# WHY two-phase: Terraform's remote "backend" needs a storage account that already
+# exists before `terraform init` can use it. But we also want Terraform to CREATE that
+# storage account. That's a chicken-and-egg problem. The standard fix: create the
+# storage account first with local state, then migrate state into it. bootstrap.sh
+# automates both phases so a fresh KK session is one command away from a full platform.
+#
+# KK NOTE: KodeKloud sessions are ephemeral — the resource group AND the state storage
+# account are destroyed when the session expires. Remote state therefore does NOT persist
+# across sessions; we use it to demonstrate the real-world workflow, and simply re-run
+# this script each session. See docs/kk-session-guide.md.
+#
+# PROD: in production the state storage account is created ONCE by a separate, long-lived
+# bootstrap pipeline (or clickops) and never destroyed; app pipelines only ever run the
+# Phase 3 `apply`. You would also use Azure AD / managed-identity auth for the backend
+# instead of the storage access key used here.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Paths & configuration
+# ---------------------------------------------------------------------------
+# Resolve repo root from this script's location so the script works no matter
+# what directory it is invoked from.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+TF_DIR="${REPO_ROOT}/terraform"
+
+# Project identity. PREFIX feeds var.prefix in every Terraform module; resource
+# names become "<prefix>-<random suffix>" so re-runs never collide.
+PREFIX="${PREFIX:-aksjenkins}"
+LOCATION="${LOCATION:-eastus}"          # KK: only eastus/westus/centralus/southcentralus — we standardize on eastus
+
+# Remote-state coordinates. The state container lives INSIDE the state storage
+# account that Phase 1 creates. These names are recomputed from Terraform outputs
+# after Phase 1, so the defaults here are only used for messaging.
+STATE_CONTAINER="${STATE_CONTAINER:-tfstate}"
+STATE_KEY="${STATE_KEY:-platform.tfstate}"
+
+# backend.tf is created in build Step 12. To do Phase 1 with LOCAL state we must
+# make sure no backend block is active, so we temporarily move it aside and restore
+# it for Phase 2. This sentinel is the parked filename.
+BACKEND_FILE="${TF_DIR}/backend.tf"
+BACKEND_PARKED="${TF_DIR}/backend.tf.bootstrap-parked"
+
+# ---------------------------------------------------------------------------
+# Pretty logging
+# ---------------------------------------------------------------------------
+c_reset='\033[0m'; c_blue='\033[34m'; c_grn='\033[32m'; c_yel='\033[33m'; c_red='\033[31m'
+log()  { printf "${c_blue}[bootstrap]${c_reset} %s\n" "$*"; }
+ok()   { printf "${c_grn}[  ok  ]${c_reset} %s\n" "$*"; }
+warn() { printf "${c_yel}[ warn ]${c_reset} %s\n" "$*"; }
+die()  { printf "${c_red}[ fail ]${c_reset} %s\n" "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Phase 0 — Preflight
+# ---------------------------------------------------------------------------
+phase0_preflight() {
+  log "Phase 0: preflight checks"
+
+  for bin in az terraform kubectl; do
+    command -v "${bin}" >/dev/null 2>&1 || die "'${bin}' not found on PATH. Run this inside the KodeKloud session (Cloud Shell / lab VM)."
+  done
+  ok "az / terraform / kubectl present"
+
+  # Confirm we are logged in to Azure (KK Cloud Shell is pre-authenticated).
+  az account show >/dev/null 2>&1 || die "Not logged in to Azure. Run 'az login' (or open KodeKloud Cloud Shell) first."
+
+  SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+  ok "Azure subscription: ${SUBSCRIPTION_ID}"
+
+  # KK provides exactly ONE resource group per session and we are NOT allowed to
+  # create one. Discover it dynamically. If several exist, prefer one matching the
+  # KK naming pattern, else take the first.
+  RESOURCE_GROUP="${RESOURCE_GROUP:-$(az group list --query "[?starts_with(name,'kk') || contains(name,'playground') || contains(name,'kodekloud')].name | [0]" -o tsv)}"
+  if [[ -z "${RESOURCE_GROUP}" || "${RESOURCE_GROUP}" == "null" ]]; then
+    RESOURCE_GROUP="$(az group list --query "[0].name" -o tsv)"
+  fi
+  [[ -n "${RESOURCE_GROUP}" && "${RESOURCE_GROUP}" != "null" ]] || die "Could not find a KodeKloud-provided resource group. Set RESOURCE_GROUP=<name> and re-run."
+  ok "KodeKloud resource group: ${RESOURCE_GROUP}"
+
+  # Export as TF_VAR_* so every module's variables pick these up automatically.
+  # (TF_VAR_foo is Terraform's convention for setting var.foo from the environment.)
+  export TF_VAR_subscription_id="${SUBSCRIPTION_ID}"
+  export TF_VAR_resource_group_name="${RESOURCE_GROUP}"
+  export TF_VAR_prefix="${PREFIX}"
+  export TF_VAR_location="${LOCATION}"
+  export ARM_SUBSCRIPTION_ID="${SUBSCRIPTION_ID}"   # azurerm provider/backend also read ARM_* env vars
+}
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Create the state storage account with LOCAL state
+# ---------------------------------------------------------------------------
+phase1_local_state() {
+  log "Phase 1: creating the state storage account with LOCAL state"
+  cd "${TF_DIR}"
+
+  # Park backend.tf so `terraform init` uses the default local backend.
+  if [[ -f "${BACKEND_FILE}" ]]; then
+    mv "${BACKEND_FILE}" "${BACKEND_PARKED}"
+    log "parked backend.tf so Phase 1 uses local state"
+  fi
+
+  terraform init -input=false -reconfigure
+
+  # -target limits apply to JUST the storage module (+ whatever it depends on),
+  # so we don't try to build AKS etc. before the backend exists.
+  terraform apply -input=false -auto-approve -target=module.storage
+
+  # Read the storage coordinates straight from the module's outputs.
+  STATE_SA="$(terraform output -raw state_storage_account_name)"
+  STATE_CONTAINER="$(terraform output -raw state_container_name)"
+  ok "state storage account: ${STATE_SA} (container: ${STATE_CONTAINER})"
+}
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Enable the remote backend and migrate state into it
+# ---------------------------------------------------------------------------
+phase2_migrate() {
+  log "Phase 2: migrating local state into the azurerm remote backend"
+  cd "${TF_DIR}"
+
+  # Fetch a storage access key for the backend. KK forbids Azure IAM role
+  # assignments, so AAD-based backend auth is unavailable — we use the access key.
+  # PROD: use `use_azuread_auth = true` + a managed identity instead of a shared key.
+  local access_key
+  access_key="$(az storage account keys list \
+    --resource-group "${RESOURCE_GROUP}" \
+    --account-name "${STATE_SA}" \
+    --query "[0].value" -o tsv)"
+  export ARM_ACCESS_KEY="${access_key}"
+
+  # Restore backend.tf so the azurerm backend block is active again.
+  if [[ -f "${BACKEND_PARKED}" ]]; then
+    mv "${BACKEND_PARKED}" "${BACKEND_FILE}"
+    log "restored backend.tf"
+  fi
+
+  # -migrate-state + -force-copy: copy the existing LOCAL state into the freshly
+  # configured REMOTE backend without an interactive prompt. -backend-config passes
+  # the values that backend.tf intentionally leaves blank (so no secrets are committed).
+  terraform init -input=false -force-copy -migrate-state \
+    -backend-config="resource_group_name=${RESOURCE_GROUP}" \
+    -backend-config="storage_account_name=${STATE_SA}" \
+    -backend-config="container_name=${STATE_CONTAINER}" \
+    -backend-config="key=${STATE_KEY}"
+
+  ok "state now lives in Azure (${STATE_SA}/${STATE_CONTAINER}/${STATE_KEY})"
+}
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Provision the whole platform
+# ---------------------------------------------------------------------------
+phase3_full_apply() {
+  log "Phase 3: applying the full platform (this provisions AKS — expect several minutes)"
+  cd "${TF_DIR}"
+  terraform apply -input=false -auto-approve
+  ok "terraform apply complete"
+}
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Wire up kubectl
+# ---------------------------------------------------------------------------
+phase4_kubeconfig() {
+  log "Phase 4: fetching AKS credentials for kubectl/helm"
+  cd "${TF_DIR}"
+
+  local aks_name
+  aks_name="$(terraform output -raw aks_cluster_name 2>/dev/null || true)"
+  if [[ -z "${aks_name}" ]]; then
+    warn "aks_cluster_name output not available yet (AKS module not built?) — skipping kubeconfig"
+    return 0
+  fi
+
+  az aks get-credentials \
+    --resource-group "${RESOURCE_GROUP}" \
+    --name "${aks_name}" \
+    --overwrite-existing
+  kubectl get nodes -o wide || warn "kubectl could not reach the cluster yet"
+  ok "kubeconfig set; cluster reachable"
+}
+
+# ---------------------------------------------------------------------------
+# Safety net: if anything fails mid-run, make sure backend.tf is restored so the
+# working tree is never left in the "parked" state.
+# ---------------------------------------------------------------------------
+restore_backend_on_exit() {
+  if [[ -f "${BACKEND_PARKED}" ]]; then
+    mv "${BACKEND_PARKED}" "${BACKEND_FILE}"
+    warn "run interrupted — restored backend.tf to its normal location"
+  fi
+}
+trap restore_backend_on_exit EXIT
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+  log "aks-jenkins-platform bootstrap starting (prefix=${PREFIX}, location=${LOCATION})"
+  phase0_preflight
+  phase1_local_state
+  phase2_migrate
+  phase3_full_apply
+  phase4_kubeconfig
+  trap - EXIT   # success: clear the safety-net trap (backend.tf already restored in Phase 2)
+  ok "BOOTSTRAP COMPLETE — platform is up. Run 'kubectl get pods -A' to explore."
+  log "When you are done for the session, run: bootstrap/destroy.sh"
+}
+
+main "$@"
