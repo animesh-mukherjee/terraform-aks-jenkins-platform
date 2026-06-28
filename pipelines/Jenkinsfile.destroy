@@ -1,0 +1,165 @@
+// =============================================================================
+// pipelines/Jenkinsfile.destroy
+//
+// Destroy pipeline — removes all Kubernetes application resources from a
+// given environment namespace. Does NOT destroy Azure infrastructure
+// (that is handled by bootstrap/destroy.sh + terraform destroy).
+//
+// Use cases:
+//   - Clean up dev or staging before a KodeKloud session expires
+//   - Remove a staging deployment before re-deploying a breaking change
+//   - Orphan cleanup: remove leftover resources from a failed deploy
+//
+// Safety mechanism:
+//   CONFIRM_DESTROY must be set to `true` to proceed. This prevents
+//   accidental destruction triggered by UI mis-clicks. The default is
+//   false so that "Build Now" (without parameters) is always a no-op.
+//
+// What gets destroyed:
+//   - Helm release (removes Deployment, Service, Ingress, ConfigMaps etc.)
+//   - K8s Secrets managed by the app Helm chart (NOT the infra secrets
+//     created by terraform/k8s-post/ — those are Terraform-managed)
+//   - Nothing in the kube-system namespace is touched
+//   - Jenkins itself is NOT destroyed by this pipeline
+//
+// What is NOT destroyed:
+//   - The namespace itself (retaining it avoids re-running k8s-post/)
+//   - K8s Secrets created by terraform/k8s-post/ (app-db-credentials etc.)
+//   - NGINX Ingress controller
+//   - CoreDNS custom ConfigMap
+// =============================================================================
+
+pipeline {
+  agent none
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    timeout(time: 20, unit: 'MINUTES')
+    ansiColor('xterm')
+    timestamps()
+  }
+
+  parameters {
+    choice(
+      name:    'ENVIRONMENT',
+      choices: ['dev', 'staging'],
+      description: 'Namespace to destroy the application from. ' +
+                   'The namespace itself is kept; only the Helm release is removed.'
+    )
+    booleanParam(
+      name:         'CONFIRM_DESTROY',
+      defaultValue: false,
+      description:  'REQUIRED: check this box to confirm you want to destroy the environment. ' +
+                    'Leaving this unchecked causes the pipeline to abort safely.'
+    )
+  }
+
+  environment {
+    APP_NAME = 'platform-sample-app'
+  }
+
+  stages {
+
+    // ── Safety check ───────────────────────────────────────────────────────
+    // Runs without an agent — just checks the parameter.
+    // If CONFIRM_DESTROY is false, the pipeline errors immediately with a
+    // clear message rather than wasting a pod slot.
+    stage('Safety Check') {
+      agent none
+      steps {
+        script {
+          if (!params.CONFIRM_DESTROY) {
+            error(
+              'CONFIRM_DESTROY is false. Set it to true to proceed. ' +
+              'This is a safety guard — "Build Now" without parameters always aborts here.'
+            )
+          }
+          echo "Destruction confirmed. Target: ${params.ENVIRONMENT} namespace."
+        }
+      }
+    }
+
+    // ── Human confirmation ─────────────────────────────────────────────────
+    // Second gate: even with CONFIRM_DESTROY=true, a human must click "Destroy".
+    // This prevents automated systems (webhooks, cron jobs) from accidentally
+    // triggering a destroy.
+    stage('Confirm') {
+      agent none
+      steps {
+        timeout(time: 5, unit: 'MINUTES') {
+          input(
+            message:   "DESTROY ${params.ENVIRONMENT} environment? This cannot be undone.",
+            ok:        'Yes, destroy it',
+            submitter: 'admin'
+          )
+        }
+      }
+    }
+
+    // ── Helm uninstall ─────────────────────────────────────────────────────
+    stage('Helm Uninstall') {
+      agent {
+        kubernetes {
+          label 'helm'
+          defaultContainer 'helm'
+        }
+      }
+      steps {
+        container('helm') {
+          sh label: "helm uninstall ${params.ENVIRONMENT}", script: '''
+            if helm status "${APP_NAME}" --namespace "${ENVIRONMENT}" \
+              >/dev/null 2>&1; then
+              echo "Uninstalling Helm release '${APP_NAME}' from '${ENVIRONMENT}'..."
+              helm uninstall "${APP_NAME}" \
+                --namespace "${ENVIRONMENT}" \
+                --wait \
+                --timeout 3m
+              echo "Helm release removed."
+            else
+              echo "No Helm release '${APP_NAME}' found in '${ENVIRONMENT}' — nothing to uninstall."
+            fi
+          '''
+        }
+      }
+    }
+
+    // ── Verify cleanup ─────────────────────────────────────────────────────
+    stage('Verify') {
+      agent {
+        kubernetes {
+          label 'helm'
+          defaultContainer 'helm'
+        }
+      }
+      steps {
+        container('helm') {
+          sh label: 'List remaining resources', script: '''
+            echo "=== Remaining workloads in ${ENVIRONMENT} namespace ==="
+            kubectl get deploy,pod,svc,ingress \
+              --namespace "${ENVIRONMENT}" \
+              --output wide 2>/dev/null || echo "(namespace may be empty)"
+
+            echo ""
+            echo "=== Helm releases in ${ENVIRONMENT} ==="
+            helm list --namespace "${ENVIRONMENT}" || echo "(none)"
+          '''
+        }
+      }
+    }
+
+  } // end stages
+
+  post {
+    success {
+      echo "Environment '${params.ENVIRONMENT}' destroyed successfully."
+    }
+    failure {
+      echo "Destroy FAILED for '${params.ENVIRONMENT}'. Manual cleanup may be needed."
+      echo "Run: kubectl delete all --all -n ${params.ENVIRONMENT}"
+    }
+    always {
+      cleanWs()
+    }
+  }
+
+}
