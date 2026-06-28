@@ -88,6 +88,7 @@ locals {
   servicebus_conn_string   = data.terraform_remote_state.root.outputs.servicebus_connection_string
   servicebus_build_queue   = data.terraform_remote_state.root.outputs.servicebus_build_queue
   servicebus_deploy_queue  = data.terraform_remote_state.root.outputs.servicebus_deploy_queue
+  aci_name                 = data.terraform_remote_state.root.outputs.aci_container_group_name
 }
 
 # ---------------------------------------------------------------------------
@@ -365,6 +366,47 @@ resource "kubernetes_secret" "app_config" {
     kubernetes_namespace.dev,
     kubernetes_namespace.staging,
   ]
+}
+
+# ---------------------------------------------------------------------------
+# Jenkins pipeline credentials secret (jenkins namespace)
+# ---------------------------------------------------------------------------
+
+# Holds credentials that JCasC (jenkins/casc/credentials.yaml) exposes as
+# Jenkins-managed credentials via ${VAR_NAME} interpolation. Keys use
+# UPPER_SNAKE_CASE so they are valid Linux environment variable names and are
+# safely injected via the Helm chart's containerEnv block (values.yaml).
+#
+# Why a separate secret instead of reading Key Vault at pipeline time?
+#   The Jenkins Kubernetes plugin creates short-lived pod agents that have no
+#   Azure identity. Key Vault access would require passing credentials into
+#   every agent pod. This secret is pre-populated by Terraform (which has Azure
+#   access) and remains static for the lifetime of the cluster.
+#
+# Why not reuse acr-pull-secret?
+#   acr-pull-secret is type kubernetes.io/dockerconfigjson — it contains a
+#   base64-encoded JSON blob. Extracting individual fields from it as env vars
+#   is not natively supported. A separate Opaque secret with flat key-value
+#   entries is simpler and directly usable in containerEnv.
+resource "kubernetes_secret" "jenkins_pipeline_creds" {
+  metadata {
+    name      = "jenkins-pipeline-creds"
+    namespace = "jenkins"
+  }
+
+  # Terraform concept: `sensitive` values in data sources (like Key Vault
+  # secrets) are automatically marked sensitive — they are redacted in
+  # `terraform plan` output and never written to plain state snapshots.
+  data = {
+    ACR_USERNAME                 = local.acr_username
+    ACR_PASSWORD                 = local.acr_password
+    ACR_LOGIN_SERVER             = local.acr_login_server
+    POSTGRESQL_CONNECTION_STRING = local.postgresql_conn_string
+    RESOURCE_GROUP_NAME          = local.rg_name
+    ACI_NAME                     = local.aci_name
+  }
+
+  depends_on = [kubernetes_namespace.jenkins]
 }
 
 # ---------------------------------------------------------------------------

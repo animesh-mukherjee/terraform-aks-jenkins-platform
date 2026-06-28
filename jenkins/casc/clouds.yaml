@@ -1,0 +1,223 @@
+# =============================================================================
+# jenkins/casc/clouds.yaml
+#
+# JCasC file 5 of 6 — Kubernetes cloud and pod agent templates.
+#
+# Defines the Kubernetes cloud that enables Jenkins to create ephemeral pod
+# agents on Node 2 of the AKS cluster. Three pod templates cover the stages
+# defined in CLAUDE.md's pipeline lifecycle.
+#
+# Template → Stages mapping:
+#   nodejs-agent (label: nodejs) → Stage 1 (Lint), Stage 2 (Tests),
+#                                   Stage 3 (Docker Build+Push), Stage 6 (Smoke),
+#                                   Stage 7 (Service Bus Notify)
+#   helm-agent   (label: helm)   → Stage 4 (ACI trigger), Stage 5 (Helm Deploy),
+#                                   Stage 9 (Helm Promote)
+#   db-agent     (label: db)     → Direct DB inspection / ad-hoc queries
+#
+# Node placement:
+#   All pod agents target Node 2 (label: dedicated=agent) via nodeSelector.
+#   The controller (Node 1) carries a taint dedicated=controller:NoSchedule
+#   that agents do NOT tolerate — so they can ONLY land on Node 2.
+#
+# Docker-in-Docker (DinD) pattern for nodejs-agent:
+#   Stage 3 requires `docker build` and `docker push`. AKS uses containerd
+#   (no /var/run/docker.sock). The nodejs-agent pod runs a `docker:dind`
+#   sidecar container with privileged=true that provides a Docker daemon
+#   accessible at tcp://localhost:2375 from the main nodejs container.
+#   PROD: replace DinD with kaniko (rootless, no privileged required) for
+#   stricter security boundaries; update Dockerfile to avoid multi-stage
+#   caching issues with kaniko.
+# =============================================================================
+
+jenkins:
+  clouds:
+    - kubernetes:
+        name: "aks-jenkins-agents"
+
+        # serverUrl: empty string tells the plugin to use the in-cluster
+        # service account token (auto-mounted at /var/run/secrets/kubernetes.io/
+        # serviceaccount/) to contact the Kubernetes API server. Jenkins is
+        # running INSIDE AKS, so this is always correct.
+        serverUrl: ""
+
+        # Namespace where pod agents are created. Must match the namespace
+        # where jenkins-sa (k8s/rbac/) has pod create/delete permissions.
+        namespace: "jenkins"
+
+        # Jenkins HTTP URL for agents to reach the controller. This is the
+        # ClusterIP service name — resolved by CoreDNS inside the cluster.
+        # Format: http://<release-name>.<namespace>.svc.cluster.local:<port>
+        # Shorthand works within the same namespace: http://jenkins:8080
+        jenkinsUrl: "http://jenkins.jenkins.svc.cluster.local:8080"
+
+        # JNLP tunnel: agents open a TCP connection here after the Jenkins
+        # controller assigns them work. The jenkins-agent Service (port 50000)
+        # is created by the Helm chart under the release name.
+        jenkinsTunnel: "jenkins-agent.jenkins.svc.cluster.local:50000"
+
+        # Don't keep agent pods running between builds — start fresh on every
+        # build for isolation and predictable resource usage on Node 2.
+        podRetention: "never"
+
+        # Maximum concurrent connections to the Kubernetes API per host.
+        # KK quotas are lenient; 32 is safe for a 2-node cluster.
+        maxRequestsPerHostStr: "32"
+
+        # Timeouts in seconds for agent connection handshakes.
+        retentionTimeout: 5
+        connectTimeout: 10
+        readTimeout: 15
+
+        templates:
+
+          # ──────────────────────────────────────────────────────────────────
+          # 1. nodejs-agent — for build, lint, test, Docker push, smoke test
+          # ──────────────────────────────────────────────────────────────────
+          - name: "nodejs-agent"
+            label: "nodejs"
+            namespace: "jenkins"
+            serviceAccount: "jenkins-sa"
+
+            # Pin to Node 2 (labeled dedicated=agent by terraform/k8s-post/).
+            nodeSelector: "dedicated=agent"
+
+            # ACR pull secret — needed only if a custom agent image from ACR
+            # is used in the future. node:18 and docker:dind are Docker Hub public.
+            imagePullSecrets:
+              - name: "acr-pull-secret"
+
+            containers:
+              # Main tool container — runs Node.js build steps.
+              # `command: cat` + `ttyEnabled: true` keeps the container alive
+              # so Jenkins can exec into it via `container('nodejs') { sh '...' }`.
+              # Without this, the container would exit immediately and the
+              # Kubernetes plugin would report "container nodejs is not alive".
+              - name: "nodejs"
+                image: "node:18-alpine"
+                ttyEnabled: true
+                command: "cat"
+                args: ""
+                workingDir: "/home/jenkins/agent"
+                envVars:
+                  # Point Docker CLI to the DinD daemon running in the sidecar.
+                  - envVar:
+                      key: "DOCKER_HOST"
+                      value: "tcp://localhost:2375"
+                  - envVar:
+                      key: "DOCKER_TLS_CERTDIR"
+                      value: ""
+                resourceRequestCpu: "500m"
+                resourceRequestMemory: "512Mi"
+                resourceLimitCpu: "1000m"
+                resourceLimitMemory: "1Gi"
+
+              # Docker-in-Docker sidecar — provides the Docker daemon for
+              # `docker build` and `docker push` in Stage 3.
+              # privileged: true is required for DinD to create container
+              # namespaces inside the pod. AKS does not enforce PodSecurity
+              # Admission (privileged tier) by default on KK.
+              # PROD: replace with kaniko (gcr.io/kaniko-project/executor) to
+              # eliminate the privileged requirement.
+              - name: "docker"
+                image: "docker:24.0-dind"
+                ttyEnabled: false
+                command: "dockerd-entrypoint.sh"
+                args: ""
+                privileged: true
+                workingDir: ""
+                envVars:
+                  # Disable TLS for the local DinD daemon — connections are
+                  # pod-local (localhost) so TLS provides no additional security.
+                  - envVar:
+                      key: "DOCKER_TLS_CERTDIR"
+                      value: ""
+                resourceRequestCpu: "300m"
+                resourceRequestMemory: "256Mi"
+                resourceLimitCpu: "700m"
+                resourceLimitMemory: "512Mi"
+
+            # Workspace volume shared between all containers in the pod.
+            # The kubernetes plugin mounts an emptyDir at /home/jenkins/agent
+            # automatically — this block is explicit for documentation.
+            volumes:
+              - emptyDirVolume:
+                  memory: false
+                  mountPath: "/home/jenkins/agent"
+
+          # ──────────────────────────────────────────────────────────────────
+          # 2. helm-agent — for Helm deploy, ACI trigger (az CLI), promote
+          # ──────────────────────────────────────────────────────────────────
+          - name: "helm-agent"
+            label: "helm"
+            namespace: "jenkins"
+            serviceAccount: "jenkins-sa"
+            nodeSelector: "dedicated=agent"
+            imagePullSecrets:
+              - name: "acr-pull-secret"
+
+            containers:
+              # dtzar/helm-kubectl bundles helm, kubectl, and az CLI in a single
+              # Alpine image — exactly what Stage 4 (az container create) and
+              # Stage 5 (helm upgrade) need without building a custom image.
+              # Pin to a specific version matching your Helm chart API version.
+              - name: "helm"
+                image: "dtzar/helm-kubectl:3.14.0"
+                ttyEnabled: true
+                command: "cat"
+                args: ""
+                workingDir: "/home/jenkins/agent"
+                envVars:
+                  # kubeconfig is auto-mounted from the jenkins-sa token — the
+                  # in-cluster config allows kubectl/helm to talk to the AKS
+                  # API server without a separate kubeconfig file.
+                  - envVar:
+                      key: "KUBECONFIG"
+                      value: ""
+                resourceRequestCpu: "300m"
+                resourceRequestMemory: "256Mi"
+                resourceLimitCpu: "700m"
+                resourceLimitMemory: "512Mi"
+
+            volumes:
+              - emptyDirVolume:
+                  memory: false
+                  mountPath: "/home/jenkins/agent"
+
+          # ──────────────────────────────────────────────────────────────────
+          # 3. db-agent — for direct PostgreSQL operations (ad-hoc / debugging)
+          # ──────────────────────────────────────────────────────────────────
+          # Stage 4 DB migrations run in ACI (not this pod) — that is by design
+          # so the migration container can be customised independently of Jenkins.
+          # This agent is for ad-hoc `psql` queries, schema inspection, and
+          # pipeline debugging steps that require direct DB access.
+          - name: "db-agent"
+            label: "db"
+            namespace: "jenkins"
+            serviceAccount: "jenkins-sa"
+            nodeSelector: "dedicated=agent"
+            imagePullSecrets:
+              - name: "acr-pull-secret"
+
+            containers:
+              - name: "db"
+                image: "bitnami/postgresql:16"
+                ttyEnabled: true
+                command: "cat"
+                args: ""
+                workingDir: "/home/jenkins/agent"
+                envVars:
+                  # Suppress psql's interactive "Password:" prompt — password
+                  # is always provided via the connection string.
+                  - envVar:
+                      key: "PGPASSWORD"
+                      value: ""
+                resourceRequestCpu: "200m"
+                resourceRequestMemory: "256Mi"
+                resourceLimitCpu: "500m"
+                resourceLimitMemory: "512Mi"
+
+            volumes:
+              - emptyDirVolume:
+                  memory: false
+                  mountPath: "/home/jenkins/agent"

@@ -1,0 +1,62 @@
+# =============================================================================
+# jenkins/casc/security.yaml
+#
+# JCasC file 2 of 6 — Authorization strategy.
+#
+# Configures: globalMatrix authorization (who can do what in Jenkins).
+# The security realm (who can log in) is in users.yaml.
+#
+# Three roles in this project:
+#   admin      → full Jenkins access — configure, manage, build, administer
+#   developer  → build + cancel + read + workspace access on all jobs
+#   viewer     → read-only access to jobs and views
+#
+# Why globalMatrix (not project-based matrix)?
+#   Project-based matrix lets you assign permissions per-job, but it requires
+#   manually updating permissions when new jobs are created. For the KK
+#   playground we use global matrix so developers can access all pipeline
+#   jobs without per-job configuration.
+#   PROD: switch to project-based matrix and assign permissions per pipeline.
+# =============================================================================
+
+jenkins:
+  authorizationStrategy:
+    # Terraform concept analogy: globalMatrix is like an Azure RBAC assignment
+    # at the subscription level — it applies to ALL resources (jobs, views,
+    # agents) within the Jenkins instance. Each entry is "permission:username".
+    globalMatrix:
+      permissions:
+        # ── admin ────────────────────────────────────────────────────────────
+        # Full administrative access. The `admin` user is the only one who can
+        # change configuration, manage plugins, or restart Jenkins.
+        - "hudson.model.Hudson.Administer:admin"
+        # Overall/Read is implied by Administer but listed explicitly for
+        # documentation clarity.
+        - "hudson.model.Hudson.Read:admin"
+
+        # ── developer ────────────────────────────────────────────────────────
+        # Developers can trigger builds and monitor results. They cannot
+        # change Jenkins configuration, manage plugins, or create/delete jobs
+        # (the Multibranch pipeline job is defined by JCasC, not developers).
+        - "hudson.model.Hudson.Read:developer"
+        - "hudson.model.Item.Build:developer"       # Trigger builds
+        - "hudson.model.Item.Cancel:developer"      # Cancel running builds
+        - "hudson.model.Item.Read:developer"        # View job pages + build history
+        - "hudson.model.Item.Workspace:developer"   # Browse agent workspace
+        - "hudson.model.Run.Update:developer"       # Annotate builds (add notes)
+        - "hudson.model.View.Read:developer"        # View dashboards
+        - "hudson.scm.SCM.Tag:developer"            # Tag source in Git from Jenkins
+
+        # ── viewer ────────────────────────────────────────────────────────────
+        # Viewers have read-only access — they can see build results and logs
+        # but cannot trigger builds or modify anything.
+        - "hudson.model.Hudson.Read:viewer"
+        - "hudson.model.Item.Read:viewer"
+        - "hudson.model.View.Read:viewer"
+
+        # ── authenticated ────────────────────────────────────────────────────
+        # Any logged-in user can read the Jenkins version and see the main page.
+        # This grants minimum access to the `developer` and `viewer` users
+        # before their specific permissions are applied.
+        # Note: permissions are additive — a user with both developer and viewer
+        # permissions gets the union of both sets.

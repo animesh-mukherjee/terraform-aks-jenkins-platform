@@ -1,0 +1,85 @@
+# jenkins-clusterrole.yaml
+#
+# Grants jenkins-sa the permissions required by the Jenkins Kubernetes plugin
+# to manage dynamic agent pods. Scoped as a ClusterRole so the same role can
+# be referenced by RoleBindings in additional namespaces (e.g. staging) if
+# build isolation is needed in future — the binding here is namespace-limited
+# to "jenkins" via ClusterRoleBinding subjects.namespace.
+#
+# Why ClusterRole instead of a namespace Role?
+#   The Jenkins K8s plugin's PodTemplate allows agents to run in any namespace.
+#   A ClusterRole makes the permission definition reusable: bind it with a
+#   RoleBinding in any namespace to allow agent pods there, without duplicating
+#   the rule set. All current bindings scope it to the "jenkins" namespace.
+#
+# Applied by: kubectl apply -k k8s/rbac/
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jenkins-agent-role
+  labels:
+    app.kubernetes.io/name: jenkins
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/managed-by: kubectl
+rules:
+  # Core pod lifecycle — Jenkins plugin creates a pod per build, waits for it
+  # to become Running, then deletes it when the build finishes.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+
+  # Pod exec — used when Jenkins runs a build step directly inside the agent
+  # container (sh/bat steps). The plugin opens an exec session to stream
+  # stdout/stderr back to the build log.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+
+  # Pod logs — streamed to the Jenkins build log while the agent pod is
+  # running, and fetched after termination for diagnostic output.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list", "watch"]
+
+  # Secrets — required so the plugin can reference the acr-pull-secret
+  # imagePullSecret in pod templates. Without get on secrets, the plugin
+  # cannot verify the secret exists before injecting it into the pod spec.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+
+  # Events — read-only; used by the plugin to surface pod scheduling events
+  # (e.g. "Insufficient memory", "ImagePullBackOff") in the Jenkins UI when
+  # an agent pod fails to start.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+
+---
+# ClusterRoleBinding — binds the ClusterRole to jenkins-sa in the "jenkins"
+# namespace. Despite using a ClusterRoleBinding (not a RoleBinding), the
+# permissions are effectively scoped to the namespace because all pod
+# operations are performed in the namespace of the ServiceAccount.
+#
+# Note: a ClusterRoleBinding + ClusterRole grants cluster-wide access.
+# If stricter isolation is required, replace this with a RoleBinding in the
+# "jenkins" namespace — the ClusterRole is still usable with a RoleBinding.
+# PROD: use a RoleBinding in each namespace where agents are allowed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jenkins-agent-binding
+  labels:
+    app.kubernetes.io/name: jenkins
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/managed-by: kubectl
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: jenkins-agent-role
+subjects:
+  - kind: ServiceAccount
+    name: jenkins-sa
+    namespace: jenkins

@@ -1,0 +1,114 @@
+# =============================================================================
+# jenkins/casc/pipelines.yaml
+#
+# JCasC file 6 of 6 — Multibranch pipeline job definition.
+#
+# Defines the `platform-sample-app` Multibranch Pipeline that Jenkins
+# discovers and runs automatically on every branch push or pull request
+# in the GitHub repo.
+#
+# Requires the `job-dsl` plugin (listed in helm/jenkins/values.yaml).
+# The `jobs:` JCasC key executes Groovy Job DSL scripts at startup to
+# create/update jobs without manual UI configuration.
+#
+# Pipeline lifecycle:
+#   1. Jenkins scans the GitHub repo on startup and every 1 minute.
+#   2. For each branch containing `pipelines/Jenkinsfile.build`, Jenkins
+#      creates a sub-project and triggers an initial build.
+#   3. GitHub webhook triggers subsequent builds on push (webhook URL:
+#      http://jenkins.platform.internal/github-webhook/).
+#
+# Before first deploy, update the GitHub org/repo references below to match
+# your fork. The repo can be public (no credentialsId needed) or private
+# (create a GitHub token credential and reference its id here).
+# =============================================================================
+
+jobs:
+  - script: |
+      // Job DSL: multibranchPipelineJob creates a Multibranch Pipeline item.
+      // Groovy DSL runs inside a sandbox — only the Job DSL API is available,
+      // not arbitrary Groovy/Java code.
+      multibranchPipelineJob('platform-sample-app') {
+
+        displayName('Platform Sample App')
+        description('''
+          Builds, tests, and deploys the sample Node.js app through the
+          full CI/CD pipeline on every branch push and pull request.
+          Stages: Checkout → Lint → Unit Test → Docker Build+Push →
+          DB Migration (ACI) → Helm Deploy (dev) → Smoke Test →
+          Service Bus Notify → Approval Gate → Helm Promote (staging)
+        '''.stripIndent())
+
+        // ── Branch sources ──────────────────────────────────────────────────
+        branchSources {
+          branchSource {
+            // Unique id — used internally to correlate the source across
+            // config changes. Changing it causes Jenkins to re-scan all
+            // branches as if they are new.
+            id('platform-sample-app-github')
+            source {
+              github {
+                id('platform-sample-app-github')
+
+                // IMPORTANT: update these to match your GitHub account/repo.
+                // repoOwner must be the GitHub username or org slug.
+                repoOwner('animeshmkhrj')
+                repository('terraform-aks-jenkins-platform')
+                repositoryUrl('https://github.com/animeshmkhrj/terraform-aks-jenkins-platform')
+
+                // credentialsId: leave empty for public repos.
+                // For private repos, create a GitHub personal access token
+                // credential in credentials.yaml and reference its id here.
+                credentialsId('')
+
+                traits {
+                  // Discover all branches on the repo (strategy 1 = all branches).
+                  gitHubBranchDiscovery {
+                    strategyId(1)
+                  }
+                  // Discover PRs from the same repo (strategy 1 = merge with target).
+                  // This triggers builds on PR creation and every commit to the PR branch.
+                  gitHubPullRequestDiscovery {
+                    strategyId(1)
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // ── Jenkinsfile path ─────────────────────────────────────────────────
+        // The build factory tells Jenkins which Jenkinsfile to use for each
+        // discovered branch. scriptPath is relative to the repo root.
+        factory {
+          workflowBranchProjectFactory {
+            scriptPath('pipelines/Jenkinsfile.build')
+          }
+        }
+
+        // ── Orphan strategy ──────────────────────────────────────────────────
+        // When a branch is deleted from GitHub, Jenkins retains the last
+        // numToKeep builds for reference before removing the sub-project.
+        orphanedItemStrategy {
+          discardOldItems {
+            numToKeep(5)
+          }
+        }
+
+        // ── Scan triggers ────────────────────────────────────────────────────
+        // Scan the GitHub repo every 1 minute to pick up new branches.
+        // In production, replace with a GitHub webhook trigger (faster +
+        // uses less API quota than polling). Webhook URL:
+        //   http://jenkins.platform.internal/github-webhook/
+        triggers {
+          periodic(1)
+        }
+
+        // ── Build retention ──────────────────────────────────────────────────
+        // Keep at most 10 builds per branch. Prevents the 10 Gi PVC from
+        // filling up with old build logs and workspace snapshots on KK.
+        configure {
+          it / 'properties' / 'jenkins.branch.BranchJobProperty$SourceId' {
+          }
+        }
+      }

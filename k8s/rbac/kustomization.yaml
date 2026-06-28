@@ -1,0 +1,34 @@
+# kustomization.yaml
+#
+# Kustomize manifest for the k8s/rbac/ directory. Allows all RBAC resources
+# to be applied in one command without managing individual file order.
+#
+# Apply (bootstrap.sh Phase 4, after k8s-post/ runs):
+#   kubectl apply -k k8s/rbac/
+#
+# Verify:
+#   kubectl get serviceaccount jenkins-sa -n jenkins
+#   kubectl get clusterrole jenkins-agent-role
+#   kubectl get clusterrolebinding jenkins-agent-binding
+#   kubectl get role,rolebinding -n dev
+#
+# Ordering note: the "jenkins" and "dev" namespaces are created by
+# terraform/k8s-post/, which must run before this kustomization. If you
+# apply this before k8s-post/ runs you will get "namespace not found" errors.
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  # 1. ServiceAccount first — ClusterRoleBinding references it by name
+  - jenkins-serviceaccount.yaml
+  # 2. ClusterRole + ClusterRoleBinding for Jenkins K8s plugin
+  - jenkins-clusterrole.yaml
+  # 3. dev namespace Roles + RoleBindings (includes jenkins-sa as a subject)
+  - dev-roles.yaml
+
+# Common labels applied to all resources in this kustomization.
+# Use `kubectl get all -l app.kubernetes.io/managed-by=kustomize -A`
+# to list everything applied from this directory.
+commonLabels:
+  app.kubernetes.io/part-of: aks-jenkins-platform

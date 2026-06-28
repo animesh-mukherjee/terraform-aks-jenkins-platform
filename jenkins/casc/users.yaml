@@ -1,0 +1,71 @@
+# =============================================================================
+# jenkins/casc/users.yaml
+#
+# JCasC file 3 of 6 — Security realm and built-in user accounts.
+#
+# Configures: the local (built-in) security realm and three user accounts.
+# Authorization (what each user can do) is in security.yaml.
+#
+# Three accounts:
+#   admin     → password from K8s Secret jenkins-admin-credentials (Terraform)
+#   developer → placeholder password — CHANGE before sharing access
+#   viewer    → placeholder password — CHANGE before sharing access
+#
+# Why ${JENKINS_ADMIN_PASSWORD} interpolation?
+#   JCasC supports environment variable interpolation in string values using
+#   the ${VAR_NAME} syntax. At startup, JCasC replaces ${JENKINS_ADMIN_PASSWORD}
+#   with the value of the env var injected from the K8s Secret. This means
+#   the password is never stored in this YAML file — safe to commit to Git.
+#
+# Why separate developer/viewer accounts with placeholder passwords?
+#   KodeKloud has no Entra ID integration (CANNOT create App Registrations).
+#   In production, replace the local realm with the Azure Active Directory
+#   plugin + Entra tenant and remove the built-in accounts entirely.
+#   PROD: replace securityRealm with azureAdPlugin for SSO.
+# =============================================================================
+
+jenkins:
+  securityRealm:
+    # local: Jenkins manages usernames and passwords in its own database.
+    # allowsSignup: false prevents anyone from registering new accounts
+    # via the login page — only JCasC can create users.
+    local:
+      allowsSignup: false
+      enableCaptcha: false
+      users:
+
+        # ── admin ─────────────────────────────────────────────────────────────
+        # Password is read from env var JENKINS_ADMIN_PASSWORD which is
+        # injected from the jenkins-admin-credentials K8s Secret in values.yaml.
+        # The Secret is created by terraform/k8s-post/ with a random_password
+        # from Terraform. Retrieve it with:
+        #   kubectl get secret jenkins-admin-credentials -n jenkins \
+        #     -o jsonpath='{.data.jenkins-admin-password}' | base64 -d
+        - id: "admin"
+          name: "Administrator"
+          password: "${JENKINS_ADMIN_PASSWORD}"
+          properties:
+            - mailer:
+                emailAddress: "animeshmkhrj@gmail.com"
+
+        # ── developer ─────────────────────────────────────────────────────────
+        # PROD: remove this account and use Entra group membership instead.
+        # The password is hardcoded here (it is NOT in a K8s Secret) because
+        # non-admin users are treated as non-privileged on KK. Change before
+        # sharing the URL with another human.
+        - id: "developer"
+          name: "Developer"
+          password: "Dev@Jenkins2024!"  # PROD: inject from Secret or use SSO
+          properties:
+            - mailer:
+                emailAddress: "developer@example.com"
+
+        # ── viewer ─────────────────────────────────────────────────────────────
+        # Read-only account for stakeholders who want to see build status.
+        # PROD: remove this account and use Entra group membership instead.
+        - id: "viewer"
+          name: "Viewer"
+          password: "View@Jenkins2024!"  # PROD: inject from Secret or use SSO
+          properties:
+            - mailer:
+                emailAddress: "viewer@example.com"

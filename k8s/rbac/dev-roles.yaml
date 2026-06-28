@@ -1,0 +1,155 @@
+# dev-roles.yaml
+#
+# Defines two Roles in the "dev" namespace — one for developers who need to
+# deploy and manage the sample app, and one for viewers who need read-only
+# access to monitor it. Each Role is paired with a RoleBinding that grants
+# those permissions to a named Kubernetes Group.
+#
+# Why Groups instead of individual user names?
+#   Groups allow you to add/remove users without changing RBAC manifests.
+#   On KodeKloud (no Entra integration), groups are asserted via the
+#   kubeconfig credentials — a kubeconfig can include "groups" in its user
+#   entry. In production with Entra SSO, group membership comes from AAD
+#   token claims automatically.
+#
+# Adding a user to the dev-developers group (KK / local kubeconfig):
+#   Edit ~/.kube/config user entry to include:
+#     user:
+#       groups: ["dev-developers"]
+#   Or use an exec credential plugin that injects group claims.
+#
+# Applied by: kubectl apply -k k8s/rbac/
+# Namespace:  dev (created by terraform/k8s-post/)
+
+---
+# ── Developer Role ──────────────────────────────────────────────────────────
+# Grants full CRUD on the resources the Jenkins deploy pipeline creates:
+# Deployments, Services, ConfigMaps, Pods. Includes patch + update verbs on
+# Deployments so `kubectl rollout undo deployment/<name>` (rollback) works.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dev-developer-role
+  namespace: dev
+  labels:
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/managed-by: kubectl
+rules:
+  # Deployments and ReplicaSets — create, update, delete, rollback
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+
+  # Services — expose app pods via ClusterIP / LoadBalancer
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+
+  # Pods — read access + log streaming for debugging deployed workloads
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+
+  # ConfigMaps — app runtime config injected at deploy time by Helm
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+
+  # Ingress — manage ingress rules for the sample app
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+
+  # HorizontalPodAutoscaler — manage autoscaling for the sample app
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+
+  # Events — read scheduling/controller events for debugging
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dev-developer-binding
+  namespace: dev
+  labels:
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/managed-by: kubectl
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dev-developer-role
+subjects:
+  # Group — add human operators to this group via their kubeconfig or AAD group claim.
+  - kind: Group
+    name: dev-developers
+    apiGroup: rbac.authorization.k8s.io
+  # Jenkins deploy pipeline runs as jenkins-sa; bind it here so Helm deploys
+  # to the dev namespace succeed without cluster-admin.
+  - kind: ServiceAccount
+    name: jenkins-sa
+    namespace: jenkins
+
+---
+# ── Viewer Role ─────────────────────────────────────────────────────────────
+# Read-only access to all standard resources in the dev namespace.
+# Wildcard "*" on resources means "all resources in the listed apiGroups".
+# Wildcard "*" on apiGroups would mean all groups — kept explicit here.
+# Verbs are limited to get/list/watch — no mutations allowed.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dev-viewer-role
+  namespace: dev
+  labels:
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/managed-by: kubectl
+rules:
+  # Core resources — pods, services, configmaps, events, endpoints
+  - apiGroups: [""]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+
+  # Apps resources — deployments, replicasets, statefulsets, daemonsets
+  - apiGroups: ["apps"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+
+  # Batch resources — jobs, cronjobs (for any migration job tracking)
+  - apiGroups: ["batch"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+
+  # Networking resources — ingresses
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+
+  # Autoscaling — view HPA state and metrics
+  - apiGroups: ["autoscaling"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dev-viewer-binding
+  namespace: dev
+  labels:
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/managed-by: kubectl
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dev-viewer-role
+subjects:
+  - kind: Group
+    name: dev-viewers
+    apiGroup: rbac.authorization.k8s.io
