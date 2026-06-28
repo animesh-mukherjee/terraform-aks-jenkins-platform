@@ -39,6 +39,22 @@ output "keyvault_name" {
   value       = module.keyvault.key_vault_name
 }
 
+output "keyvault_id" {
+  description = "Full Azure resource ID of the Key Vault. Used by terraform/k8s-post/ as the key_vault_id argument in data \"azurerm_key_vault_secret\" lookups to read ACR credentials without exposing them as root outputs."
+  value       = module.keyvault.key_vault_id
+}
+
+output "postgresql_server_fqdn" {
+  description = "FQDN of the PostgreSQL Flexible Server (e.g. \"psql-<prefix>-<suffix>.postgres.database.azure.com\"). Used by k8s-post/ to populate the DB_HOST field in the app K8s Secret alongside the full connection string."
+  value       = module.postgresql.server_fqdn
+  sensitive   = true
+}
+
+output "postgresql_admin_login" {
+  description = "PostgreSQL admin username (default: \"pgadmin\"). Used by k8s-post/ to populate the DB_USER field in the app K8s Secret."
+  value       = module.postgresql.administrator_login
+}
+
 output "log_analytics_workspace_name" {
   description = "Log Analytics Workspace name. Used with `az monitor log-analytics query --workspace <name>` to run KQL queries against container logs."
   value       = module.loganalytics.workspace_name
