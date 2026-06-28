@@ -1,124 +1,268 @@
-# Architecture Decision Records (ADRs)
+# Architectural Decision Records
 
-Each record captures a decision, its context, and its consequences. Sandbox-driven
-decisions also note the **production delta** — what would change outside the KodeKloud
-Playground.
-
----
-
-## ADR-001 — Reference the existing resource group instead of creating one
-
-**Status:** Accepted
-**Context:** KodeKloud forbids creating resource groups; one is provided per session.
-**Decision:** Every module consumes the RG via `data "azurerm_resource_group"`. The RG
-name is discovered at runtime by `bootstrap.sh` and injected as `TF_VAR_resource_group_name`.
-**Consequences:** The repo is portable to any RG. **PROD:** you would own the RG
-lifecycle and likely create it (or receive it from a landing-zone module).
+Each ADR documents a decision forced by KodeKloud Playground constraints.
+Every record includes the production alternative so these constraints are
+easy to lift when moving to a real Azure environment.
 
 ---
 
-## ADR-002 — Kubernetes RBAC instead of Azure IAM
+## ADR-001: Reference the KK resource group instead of creating one
 
-**Status:** Accepted
-**Context:** Creating/modifying Azure role assignments is blocked.
-**Decision:** Access control is expressed entirely in Kubernetes RBAC (Roles /
-ClusterRoles / bindings) and Jenkins matrix authorization.
-**Consequences:** Fully portable, cluster-scoped authz that is independent of Azure
-RBAC. **PROD:** combine with AKS workload identity + Azure RBAC for defense in depth.
+**Context**  
+Every Azure resource must live in a resource group. Normally Terraform creates
+one with `azurerm_resource_group`.
 
----
+**Decision**  
+Use `data "azurerm_resource_group"` to reference the KK-provided group.
+The name is passed in via `var.resource_group_name`.
 
-## ADR-003 — Jenkins JCasC matrix auth instead of Entra SSO
+**Consequences**  
+Terraform cannot manage the resource group lifecycle. `terraform destroy`
+does not delete it. The KK session expiry handles cleanup.
 
-**Status:** Accepted
-**Context:** Entra App Registrations / OIDC SSO cannot be created.
-**Decision:** Jenkins security is defined in JCasC using matrix authorization with
-built-in users (`admin` / `developer` / `viewer`). Credentials originate from Key Vault.
-**Consequences:** Zero external IdP dependency; reproducible from code. **PROD:** wire
-Jenkins to Entra ID (OIDC) or SAML and delete the built-in users.
+**PROD alternative**  
+Add `resource "azurerm_resource_group" "main"` and reference it with
+`azurerm_resource_group.main.name` throughout all modules.
 
 ---
 
-## ADR-004 — Key Vault → kubernetes_secret instead of the CSI Secret Store driver
+## ADR-002: No Azure IAM role assignments → Kubernetes-native RBAC
 
-**Status:** Accepted
-**Context:** AKS add-ons (including the CSI Secret Store driver) cannot be installed.
-**Decision:** Terraform reads each Key Vault secret and creates a native
-`kubernetes_secret`. All secret outputs are `sensitive = true`.
-**Consequences:** Secrets are present in Terraform **state**, so state is treated as
-sensitive and never committed. **PROD:** use the CSI driver or workload identity so
-secrets are mounted at runtime and never enter state.
+**Context**  
+The platform needs access control for Jenkins users and for AKS workload
+identities (e.g., AcrPull for the kubelet identity).
 
----
+**Decision**  
+KK blocks `azurerm_role_assignment`. Replaced entirely with:
+- **Jenkins users** → Matrix Authorization Strategy via JCasC (`security.yaml`)
+- **K8s workloads** → ClusterRole + RoleBinding via `k8s/rbac/`
+- **ACR image pull** → `admin_enabled = true` on ACR + `dockerconfigjson` K8s Secret
 
-## ADR-005 — ACR admin user + imagePullSecret instead of the AcrPull role
+**Consequences**  
+ACR admin credentials are long-lived and cannot be scoped to read-only.
+The `jenkins-sa` ClusterRoleBinding grants cluster-wide pod permissions.
 
-**Status:** Accepted
-**Context:** Assigning `AcrPull` to the AKS kubelet identity is blocked.
-**Decision:** ACR runs with `admin_enabled=true`; its admin credentials are stored in
-Key Vault and projected into AKS as an `imagePullSecret`.
-**Consequences:** Works without any Azure role assignment. **PROD:** disable the admin
-user and grant `AcrPull` to the kubelet managed identity.
-
----
-
-## ADR-006 — Two-phase remote state (local → migrate)
-
-**Status:** Accepted
-**Context:** The azurerm backend needs the state storage account to exist before
-`terraform init`, but Terraform also creates that account (chicken-and-egg).
-**Decision:** `bootstrap.sh` first applies *only* the storage module with local state,
-then enables `backend.tf` and runs `terraform init -migrate-state` to move state into
-Azure Storage. `destroy.sh` reverses this (migrate back to local, then destroy).
-**Consequences:** Demonstrates the real backend-migration workflow. **PROD:** the state
-storage account is created once by a separate long-lived bootstrap and never destroyed;
-app pipelines only ever `apply`. Backend auth here uses the storage access key because
-AAD-based auth would need a role assignment; **PROD** uses `use_azuread_auth = true`.
+**PROD alternative**  
+Enable Workload Identity and Federated Credentials. Assign `AcrPull` to the
+kubelet managed identity (pods pull images automatically). Assign `AcrPush`
+to the CI managed identity for builds. Remove `admin_enabled = true`.
 
 ---
 
-## ADR-007 — azurerm provider 4.x
+## ADR-003: No Entra App Registrations → JCasC local security realm
 
-**Status:** Accepted
-**Context:** Choice between azurerm 3.x (heavily documented) and 4.x (current).
-**Decision:** Target **azurerm 4.x** for current best-practice syntax (explicit
-`subscription_id`, `features {}` block) — appropriate for a 2026 portfolio piece.
-**Consequences:** Some tutorials written for 3.x won't match verbatim; concept comments
-in the code bridge the gap.
+**Context**  
+Standard Jenkins SSO on Azure uses the Azure Active Directory plugin with an
+Entra App Registration.
 
----
+**Decision**  
+KK blocks App Registration creation. Using the Jenkins built-in local security
+realm with three accounts (admin, developer, viewer) in `jenkins/casc/users.yaml`.
+Admin password is injected from a K8s Secret; developer/viewer passwords are
+hardcoded in JCasC.
 
-## ADR-008 — Jenkins via the official Helm chart + JCasC
+**Consequences**  
+No SSO. If the repo is public, the developer and viewer passwords are visible.
+Change them before sharing repo access.
 
-**Status:** Accepted
-**Context:** Choice between the official `jenkins/jenkins` Helm chart and hand-rolled
-Kubernetes manifests.
-**Decision:** Use the official Helm chart, configured entirely through
-`helm/jenkins/values.yaml` and JCasC files. No manual UI configuration.
-**Consequences:** Industry-standard, upgrade-friendly, fully reproducible. The chart's
-Kubernetes plugin provides the ephemeral pod-agent capability we rely on.
-
----
-
-## ADR-009 — Single node pool, controller/agent split via taint + label
-
-**Status:** Accepted
-**Context:** Sandbox allows only 1 node pool, max 2 nodes.
-**Decision:** Taint Node 1 (`dedicated=controller:NoSchedule`) for the controller +
-ingress; label Node 2 (`dedicated=agent`) for pod agents. Controller runs
-`executors=0`. Both `requests` and `limits` are set on every pod.
-**Consequences:** Deterministic scheduling within a tight 2-node budget. **PROD:** use
-separate, autoscaling node pools for controller vs agents.
+**PROD alternative**  
+Replace `securityRealm.local` with the `azure-ad` JCasC plugin block. Create
+an Entra App Registration, configure redirect URIs, and map Entra groups to
+Jenkins roles in the matrix strategy.
 
 ---
 
-## ADR-010 — Ephemeral per-session state, re-applied each session
+## ADR-004: No AKS CSI Secret Store addon → Terraform-managed K8s Secrets
 
-**Status:** Accepted
-**Context:** KodeKloud reclaims the entire resource group (state storage included) when
-a session ends.
-**Decision:** Treat state as ephemeral; re-run `bootstrap.sh` each session. The
-two-phase pattern is kept for its educational/portfolio value, not for cross-session
-persistence.
-**Consequences:** No long-lived state to manage or lock. **PROD:** state persists and
-is locked; never destroyed between deploys.
+**Context**  
+The standard pattern for feeding Azure Key Vault secrets into pods is the CSI
+Secret Store driver, enabled as an AKS add-on.
+
+**Decision**  
+KK blocks AKS add-on installation. Instead, `terraform/k8s-post/main.tf` reads
+secrets from Key Vault with `data "azurerm_key_vault_secret"` and writes them
+as standard `kubernetes_secret` resources. Pods consume them via `envFrom`.
+
+**Consequences**  
+Secrets live in Kubernetes etcd. Secret values appear in Terraform state.
+Rotation requires `terraform apply`.
+
+**PROD alternative**  
+Enable the CSI Secret Store add-on:
+```hcl
+key_vault_secrets_provider {
+  secret_rotation_enabled = true
+}
+```
+Use `SecretProviderClass` objects to mount secrets directly from Key Vault
+without etcd and without touching Terraform state.
+
+---
+
+## ADR-005: ACR admin credentials for image pull → imagePullSecret
+
+**Context**  
+The standard approach for AKS pulling from ACR is assigning the `AcrPull`
+role to the kubelet managed identity — no credentials needed.
+
+**Decision**  
+KK blocks role assignments. Using `admin_enabled = true` on the ACR resource
+and a `kubernetes.io/dockerconfigjson` Secret (`acr-pull-secret`) in all three
+namespaces. Pods reference it via `imagePullSecrets`.
+
+**Consequences**  
+ACR admin is a single shared credential; not per-workload. Both the pull secret
+and `jenkins-pipeline-creds` contain the same ACR password.
+
+**PROD alternative**  
+`admin_enabled = false`. Use managed identity + `AcrPull` role assignment.
+AKS nodes pull images using their Azure identity automatically — no secrets.
+
+---
+
+## ADR-006: Single node pool with per-node taint/label via null_resource
+
+**Context**  
+The architecture requires Node 1 for the Jenkins controller (tainted to repel
+agents) and Node 2 for agent pods (labeled for affinity).
+
+**Decision**  
+KK limits AKS to 1 node pool. Node-pool-level taints apply to ALL nodes in
+the pool. Per-node taint/label is applied post-provision by
+`null_resource.node_placement` in `k8s-post/main.tf` via `az aks command invoke`.
+
+Nodes are sorted by `creationTimestamp`: oldest → Node 1 (controller),
+newest → Node 2 (agent). AKS provisions nodes sequentially so this is stable.
+
+**Consequences**  
+On node replacement (OS upgrade, spot eviction), the new node gets wrong
+placement until the null_resource re-triggers (any cluster change causes this).
+
+**PROD alternative**  
+Two separate node pools:
+- Pool 1: `node_taints = ["dedicated=controller:NoSchedule"]` (count = 1)
+- Pool 2: `node_labels = { dedicated = "agent" }` (count = N, autoscaling)
+
+Node pools handle placement declaratively and survive node replacement.
+
+---
+
+## ADR-007: Docker-in-Docker (DinD) for image builds
+
+**Context**  
+Jenkins Stage 3 needs `docker build` and `docker push`. AKS uses containerd,
+so there is no `/var/run/docker.sock` on the host.
+
+**Decision**  
+The `nodejs-agent` pod template (JCasC `clouds.yaml`) runs a `docker:dind`
+sidecar with `privileged: true`. The main container connects via
+`DOCKER_HOST=tcp://localhost:2375`. `DOCKER_TLS_CERTDIR=""` disables TLS for
+the localhost connection.
+
+**Consequences**  
+`privileged: true` gives the DinD container full host kernel access — a
+significant security risk in production. KK does not enforce Pod Security
+Standards, so it works here.
+
+**PROD alternative**  
+Replace DinD with [kaniko](https://github.com/GoogleContainerTools/kaniko):
+```yaml
+image: gcr.io/kaniko-project/executor
+args: ["--dockerfile=Dockerfile", "--context=dir://app-sample", "--destination=<acr>.azurecr.io/app:<tag>"]
+```
+Kaniko builds without a daemon, without root, and without privileged mode.
+
+---
+
+## ADR-008: ClusterRoleBinding for jenkins-sa (not RoleBinding)
+
+**Context**  
+The Jenkins Kubernetes plugin needs to create, exec into, and delete agent pods
+in the `jenkins` namespace. The `jenkins-sa` ServiceAccount requires pod
+permissions.
+
+**Decision**  
+A `ClusterRole` is bound via `ClusterRoleBinding`, giving `jenkins-sa` pod
+permissions across ALL namespaces.
+
+**Consequences**  
+A compromised build running as `jenkins-sa` could create, exec into, or delete
+pods in any namespace, including `kube-system`.
+
+**PROD alternative**  
+Replace the `ClusterRoleBinding` with a `RoleBinding` scoped to the `jenkins`
+namespace. The `ClusterRole` definition remains; only the binding type changes.
+If agents need to deploy to `dev`/`staging`, add separate RoleBindings there.
+
+---
+
+## ADR-009: Partial backend configuration (no hardcoded storage account name)
+
+**Context**  
+Terraform requires a backend configuration for remote state. The storage account
+name has a random suffix (from `random_string`) that isn't known before the first
+`terraform apply`.
+
+**Decision**  
+`terraform/backend.tf` hardcodes only the static values (`container_name`, `key`).
+The dynamic values (`resource_group_name`, `storage_account_name`) are passed via
+`-backend-config` flags at `terraform init` time — in `bootstrap.sh` and both
+GitHub Actions workflows.
+
+**Consequences**  
+`terraform init` always needs the `-backend-config` flags. A plain `terraform init`
+fails. This is documented in all places that call init.
+
+**PROD alternative**  
+Use a pre-existing storage account with a stable, known name — provisioned
+separately by a platform team. Hardcode all four backend values in `backend.tf`.
+
+---
+
+## ADR-010: Separate Terraform root for k8s-post/
+
+**Context**  
+Kubernetes resources (K8s Secrets, node taints) depend on the AKS cluster
+existing AND on values from other Azure modules (Key Vault secrets, ACR
+login server). They also need the cluster's kubeconfig.
+
+**Decision**  
+`terraform/k8s-post/` is a separate Terraform root that reads root outputs via
+`data "terraform_remote_state"`. The kubernetes provider uses `config_path =
+"~/.kube/config"` written by `az aks get-credentials` in `bootstrap.sh`.
+
+**Consequences**  
+The kubeconfig must be written by bootstrap before `k8s-post apply`. The
+provider block cannot use `data` source values (evaluated at plan time, before
+data sources). Two `terraform apply` runs are required per session.
+
+**PROD alternative**  
+Single Terraform root with the kubernetes provider configured directly from AKS
+outputs (`host`, `client_certificate`, `client_key`, `cluster_ca_certificate`).
+Eliminates the two-root split but creates a provider dependency order constraint.
+
+---
+
+## ADR-011: ACI one-shot pattern with lifecycle ignore_changes
+
+**Context**  
+Jenkins Stage 4 runs a DB migration container using the image built in Stage 3
+(with a commit SHA tag). Terraform provisions the ACI shape; Jenkins manages
+each run's image.
+
+**Decision**  
+`azurerm_container_group.migration` is provisioned with a placeholder image
+(`alpine:3.19`) and `lifecycle { ignore_changes = [container[0].image] }`.
+Jenkins replaces the image at build time via `az container create --image
+<acr>/<migration-image>:<sha>`. Terraform ignores the image field on subsequent
+applies.
+
+**Consequences**  
+`terraform state` shows the placeholder image. `terraform plan` always shows
+"no changes" for the image field. The actual running image is only visible via
+`az container show`.
+
+**PROD alternative**  
+Use Azure Container Apps Jobs or a Kubernetes Job for migrations. Both support
+managed identity, retry policies, and direct ACR integration — no placeholder
+image, no state drift.
