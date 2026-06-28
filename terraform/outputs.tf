@@ -24,6 +24,11 @@ output "state_storage_account_name" {
   value       = module.storage.state_storage_account_name
 }
 
+output "state_container_name" {
+  description = "Name of the blob container holding the Terraform state file (always \"tfstate\"). Used by bootstrap.sh Phase 1 to confirm the container name for the backend -backend-config flags."
+  value       = module.storage.state_container_name
+}
+
 output "acr_login_server" {
   description = "ACR FQDN (e.g. \"acr<prefix><suffix>.azurecr.io\"). Use as the image prefix in Docker push/pull commands and in Jenkinsfiles."
   value       = module.acr.login_server
