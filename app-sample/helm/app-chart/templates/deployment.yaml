@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "app-chart.fullname" . }}
+  labels:
+    {{- include "app-chart.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "app-chart.selectorLabels" . | nindent 6 }}
+  # RollingUpdate: replace one pod at a time. maxUnavailable=0 means the old
+  # pod stays up until the new one passes its readiness probe — zero-downtime
+  # for an app with replicaCount=1.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge:       1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "app-chart.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Force pod restart when the ConfigMap changes (feature flags update).
+        # The annotation value is a hash of the ConfigMap data; helm upgrade
+        # changes this hash whenever featureFlags or appConfig values change.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Run as the built-in node user (uid 1000) — matches Dockerfile USER node.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser:    1000
+        fsGroup:      1000
+      containers:
+        - name: app
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          # ── Environment sources ─────────────────────────────────────────────
+          # Load env vars from three sources in merge order (last wins):
+          #   1. app-db-credentials   — DATABASE_URL, DB_HOST, DB_PORT, DB_NAME, DB_USER
+          #   2. app-config-credentials — APPCONFIG_CONNECTION_STRING
+          #   3. ConfigMap            — FEATURE_*, APP_ENVIRONMENT, LOG_LEVEL, DB_MAX_CONNECTIONS
+          envFrom:
+            - secretRef:
+                name: app-db-credentials
+            - secretRef:
+                name: app-config-credentials
+            - configMapRef:
+                name: {{ include "app-chart.fullname" . }}-config
+          # DB_SSL is not in the secret — set inline as it is not sensitive.
+          env:
+            - name: DB_SSL
+              value: "require"
+          # ── Probes ───────────────────────────────────────────────────────────
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds:       {{ .Values.probes.readiness.periodSeconds }}
+            failureThreshold:    {{ .Values.probes.readiness.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds:       {{ .Values.probes.liveness.periodSeconds }}
+            failureThreshold:    {{ .Values.probes.liveness.failureThreshold }}
+          # ── Resources ────────────────────────────────────────────────────────
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
