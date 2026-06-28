@@ -152,23 +152,12 @@ phase2_migrate() {
 # Phase 3 — Provision the whole platform
 # ---------------------------------------------------------------------------
 phase3_full_apply() {
+  log "Phase 3: applying the full platform (expect ~20 min — AKS provisioning is the slow step)"
   cd "${TF_DIR}"
-
-  # Pass 3a: create Log Analytics + AKS first.
-  # The DNS module's VNet link uses `count = var.aks_vnet_id != "" ? 1 : 0`.
-  # That value comes from `data.azurerm_resources.aks_vnet` which has
-  # `depends_on = [module.aks]` — making it "known after apply" on the first
-  # plan. Terraform refuses to evaluate `count` on an unknown value.
-  # Solution: apply AKS in a targeted pass so the VNet exists before the
-  # full plan runs. On Pass 3b the data source resolves at plan time (AKS
-  # already exists), count is concrete, and the VNet link is created.
-  log "Phase 3a: provisioning Log Analytics + AKS cluster (prerequisite for DNS VNet link)"
-  terraform apply -input=false -auto-approve \
-    -target=module.loganalytics \
-    -target=module.aks
-  ok "AKS cluster provisioned"
-
-  log "Phase 3b: applying all remaining platform resources (~10 min)"
+  # Single apply is sufficient. The DNS VNet link count is driven by
+  # var.enable_vnet_link (a plain bool, always true), which is known at plan
+  # time. virtual_network_id is "known after apply" but that is fine for
+  # an attribute value — only count must be concrete at plan time.
   terraform apply -input=false -auto-approve
   ok "terraform apply complete"
 }

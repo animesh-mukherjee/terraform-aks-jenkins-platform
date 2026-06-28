@@ -70,11 +70,14 @@ resource "azurerm_private_dns_zone" "this" {
 # every AKS node to auto-register would pollute the zone with node names we
 # don't need.
 #
-# `count` — the VNet link is conditional. If `var.aks_vnet_id` is empty
-# (default), no link is created and the zone exists but answers nothing.
-# The root module passes the AKS kubenet VNet ID after the cluster is ready.
+# `count` — controlled by var.enable_vnet_link (a plain bool, always true in
+# normal deployments). We deliberately do NOT use `var.aks_vnet_id != "" ? 1 : 0`
+# here because aks_vnet_id is passed from a data source with depends_on=[module.aks],
+# making it "known after apply" on the first plan. Terraform rejects a deferred value
+# in a count expression. A plain bool variable is always known at plan time, so
+# count = 1 is concrete during plan even though virtual_network_id is deferred.
 resource "azurerm_private_dns_zone_virtual_network_link" "aks" {
-  count = var.aks_vnet_id != "" ? 1 : 0
+  count = var.enable_vnet_link ? 1 : 0
 
   # Link names must be unique within the zone; prefix scopes it to this cluster.
   name                  = "link-aks-${var.prefix}"
