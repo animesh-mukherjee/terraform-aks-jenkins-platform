@@ -26,8 +26,14 @@ variable "zone_name" {
 
 variable "aks_vnet_id" {
   type        = string
-  description = "Full Azure resource ID of the VNet to link to this DNS zone. For kubenet AKS the VNet lives in the MC_ node resource group; the root module looks it up with data \"azurerm_resources\" after AKS is created. Pass an empty string to skip the VNet link (zone is created but answers no queries until linked)."
+  description = "Full Azure resource ID of the VNet to link to this DNS zone. For kubenet AKS the VNet lives in the MC_ node resource group; the root module looks it up with data \"azurerm_resources\" after AKS is created. May be \"(known after apply)\" at plan time — set via enable_vnet_link instead of using this for count."
   default     = ""
+}
+
+variable "enable_vnet_link" {
+  type        = bool
+  description = "Whether to create the VNet link between this DNS zone and the AKS VNet. Always true in normal deployments. Kept as a variable (rather than using aks_vnet_id != \"\" as the count guard) because aks_vnet_id is \"known after apply\" on the first plan — Terraform forbids using a deferred value in a count expression. A plain bool is always known at plan time."
+  default     = true
 }
 
 variable "tags" {

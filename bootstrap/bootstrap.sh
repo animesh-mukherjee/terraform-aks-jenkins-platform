@@ -47,12 +47,6 @@ LOCATION="${LOCATION:-eastus}"          # KK: only eastus/westus/centralus/south
 STATE_CONTAINER="${STATE_CONTAINER:-tfstate}"
 STATE_KEY="${STATE_KEY:-platform.tfstate}"
 
-# backend.tf is created in build Step 12. To do Phase 1 with LOCAL state we must
-# make sure no backend block is active, so we temporarily move it aside and restore
-# it for Phase 2. This sentinel is the parked filename.
-BACKEND_FILE="${TF_DIR}/backend.tf"
-BACKEND_PARKED="${TF_DIR}/backend.tf.bootstrap-parked"
-
 # ---------------------------------------------------------------------------
 # Pretty logging
 # ---------------------------------------------------------------------------
@@ -104,13 +98,13 @@ phase1_local_state() {
   log "Phase 1: creating the state storage account with LOCAL state"
   cd "${TF_DIR}"
 
-  # Park backend.tf so `terraform init` uses the default local backend.
-  if [[ -f "${BACKEND_FILE}" ]]; then
-    mv "${BACKEND_FILE}" "${BACKEND_PARKED}"
-    log "parked backend.tf so Phase 1 uses local state"
-  fi
-
-  terraform init -input=false -reconfigure
+  # -backend=false: ignore the backend.tf configuration entirely.
+  # Terraform writes state to terraform.tfstate in the working directory instead
+  # of initialising any remote backend. This avoids the "Unsetting the previously
+  # set backend 'azurerm'" error that occurs on re-runs where .terraform/ still
+  # holds azurerm backend configuration from a previous Phase 2.
+  # PROD: always use a remote backend; -backend=false is a bootstrap-only workaround.
+  terraform init -input=false -backend=false
 
   # -target limits apply to JUST the storage module (+ whatever it depends on),
   # so we don't try to build AKS etc. before the backend exists.
@@ -139,15 +133,12 @@ phase2_migrate() {
     --query "[0].value" -o tsv)"
   export ARM_ACCESS_KEY="${access_key}"
 
-  # Restore backend.tf so the azurerm backend block is active again.
-  if [[ -f "${BACKEND_PARKED}" ]]; then
-    mv "${BACKEND_PARKED}" "${BACKEND_FILE}"
-    log "restored backend.tf"
-  fi
-
-  # -migrate-state + -force-copy: copy the existing LOCAL state into the freshly
-  # configured REMOTE backend without an interactive prompt. -backend-config passes
-  # the values that backend.tf intentionally leaves blank (so no secrets are committed).
+  # -migrate-state + -force-copy: copy the existing LOCAL state (terraform.tfstate)
+  # into the freshly configured REMOTE backend without an interactive prompt.
+  # -backend-config passes the values that backend.tf intentionally leaves blank
+  # (so no secrets are committed to the repo).
+  # backend.tf is present and active here — Phase 1 used -backend=false to ignore it,
+  # leaving the file untouched on disk.
   terraform init -input=false -force-copy -migrate-state \
     -backend-config="resource_group_name=${RESOURCE_GROUP}" \
     -backend-config="storage_account_name=${STATE_SA}" \
@@ -161,8 +152,12 @@ phase2_migrate() {
 # Phase 3 — Provision the whole platform
 # ---------------------------------------------------------------------------
 phase3_full_apply() {
-  log "Phase 3: applying the full platform (this provisions AKS — expect several minutes)"
+  log "Phase 3: applying the full platform (expect ~20 min — AKS provisioning is the slow step)"
   cd "${TF_DIR}"
+  # Single apply is sufficient. The DNS VNet link count is driven by
+  # var.enable_vnet_link (a plain bool, always true), which is known at plan
+  # time. virtual_network_id is "known after apply" but that is fine for
+  # an attribute value — only count must be concrete at plan time.
   terraform apply -input=false -auto-approve
   ok "terraform apply complete"
 }
@@ -230,18 +225,6 @@ phase5_k8s_post() {
 }
 
 # ---------------------------------------------------------------------------
-# Safety net: if anything fails mid-run, make sure backend.tf is restored so the
-# working tree is never left in the "parked" state.
-# ---------------------------------------------------------------------------
-restore_backend_on_exit() {
-  if [[ -f "${BACKEND_PARKED}" ]]; then
-    mv "${BACKEND_PARKED}" "${BACKEND_FILE}"
-    warn "run interrupted — restored backend.tf to its normal location"
-  fi
-}
-trap restore_backend_on_exit EXIT
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 main() {
@@ -252,7 +235,6 @@ main() {
   phase3_full_apply
   phase4_kubeconfig
   phase5_k8s_post
-  trap - EXIT   # success: clear the safety-net trap (backend.tf already restored in Phase 2)
   ok "BOOTSTRAP COMPLETE — platform is up."
   log "Next: helm upgrade --install jenkins jenkins/jenkins --namespace jenkins --values helm/jenkins/values.yaml --wait"
   log "Then: kubectl apply -k k8s/rbac/ && kubectl apply -k jenkins/casc/"

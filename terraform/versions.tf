@@ -37,6 +37,13 @@ terraform {
 # The `features {}` block is REQUIRED in azurerm 4.x even when empty.
 # It controls provider-level lifecycle behaviour for certain resource types.
 provider "azurerm" {
+  # KK workaround: playground credentials cannot register Resource Providers.
+  # Terraform tries to auto-register every provider it supports on init/apply.
+  # "none" disables this entirely — providers used by this project (Storage,
+  # KeyVault, ContainerService, etc.) are already registered in the KK subscription.
+  # PROD: remove this line — auto-registration is safe and useful in real subscriptions.
+  resource_provider_registrations = "none"
+
   features {
     # Terraform concept: the `key_vault` features block controls how the
     # provider handles Key Vault soft-delete lifecycle during `terraform destroy`.

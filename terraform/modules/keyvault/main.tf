@@ -22,7 +22,7 @@ resource "azurerm_key_vault" "this" {
 
   # KK constraint: Standard SKU only (Premium requires dedicated HSM allocation unavailable on playground).
   # PROD: sku_name = "Premium" for HSM-backed keys and regulatory compliance (PCI, HIPAA).
-  sku_name = "Standard"
+  sku_name = "standard"
 
   # KK constraint: purge_protection=false required — enabling it would lock the vault
   # for 90 days after deletion, which conflicts with the session-based playground lifecycle.

@@ -132,9 +132,8 @@ jobs:
             -no-color
 
       # ── 6. Phase 2: Plan (for log visibility) ────────────────────────────
-      # Run a plan before apply so the Actions log shows exactly what will
-      # change. The plan output is not posted as a comment here (this job
-      # runs on merge, not on PR — no PR context available).
+      # The DNS VNet link count is driven by var.enable_vnet_link (a plain bool,
+      # always true), which is known at plan time — no targeted pre-apply needed.
       - name: Phase 2 — Plan
         run: |
           terraform plan \
@@ -143,8 +142,6 @@ jobs:
             2>&1 | tee plan-output.txt
 
       # ── 7. Phase 2: Apply everything ────────────────────────────────────
-      # Apply all modules in dependency order (Terraform resolves the graph).
-      # -auto-approve skips the interactive "yes/no" prompt.
       - name: Phase 2 — Apply all modules
         run: |
           terraform apply \

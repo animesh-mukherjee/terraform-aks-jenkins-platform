@@ -10,11 +10,13 @@
 #   The storage account that holds our state is created by module.storage,
 #   but Terraform needs the backend configured BEFORE it can apply anything.
 #   Solution: two-phase bootstrap in bootstrap.sh:
-#     Phase 1 — apply module.storage with LOCAL state (-target=module.storage)
-#     Phase 2 — re-init Terraform pointing at the new storage account
-#               (terraform init -reconfigure -backend-config=...)
-#               which migrates the local state into the blob container
-#     Phase 3 — apply the rest of the root module normally
+#     Phase 1 — `terraform init -backend=false` (ignores this file entirely)
+#               then `terraform apply -target=module.storage`
+#               State is written to a local terraform.tfstate file.
+#     Phase 2 — `terraform init -migrate-state -force-copy -backend-config=...`
+#               This file is now active; Terraform copies local state into
+#               the blob container and switches all future operations to remote.
+#     Phase 3 — apply the rest of the root module normally with remote state.
 #
 # Partial backend configuration:
 #   Terraform allows some backend keys to be omitted from the file and
@@ -26,14 +28,16 @@
 #     container_name — always "tfstate" (set in module.storage variables.tf)
 #     key            — the blob path within the container
 #
-#   Dynamic keys (passed by bootstrap.sh via -backend-config):
+#   Dynamic keys (passed by bootstrap.sh Phase 2 via -backend-config):
 #     resource_group_name  — the KK-provided RG name
 #     storage_account_name — output of module.storage (includes random suffix)
 #
 # bootstrap.sh Phase 2 command:
-#   terraform init -reconfigure \
-#     -backend-config="resource_group_name=${RG_NAME}" \
-#     -backend-config="storage_account_name=$(terraform output -raw state_storage_account_name)"
+#   terraform init -input=false -force-copy -migrate-state \
+#     -backend-config="resource_group_name=${RESOURCE_GROUP}" \
+#     -backend-config="storage_account_name=${STATE_SA}" \
+#     -backend-config="container_name=tfstate" \
+#     -backend-config="key=platform.tfstate"
 # =============================================================================
 
 terraform {
