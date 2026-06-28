@@ -131,21 +131,34 @@ jobs:
             -force-copy \
             -no-color
 
-      # ── 6. Phase 2: Plan (for log visibility) ────────────────────────────
-      # Run a plan before apply so the Actions log shows exactly what will
-      # change. The plan output is not posted as a comment here (this job
-      # runs on merge, not on PR — no PR context available).
-      - name: Phase 2 — Plan
+      # ── 6. Phase 2a: Apply AKS first (DNS VNet link workaround) ─────────────
+      # The DNS module's VNet link uses count = var.aks_vnet_id != "" ? 1 : 0.
+      # aks_vnet_id comes from a data source with depends_on = [module.aks],
+      # making it "known after apply" on the first plan — Terraform rejects
+      # count on an unknown value. Fix: apply AKS in a targeted pass first so
+      # the VNet exists before the full plan runs.
+      # This is a no-op on re-runs where AKS already exists.
+      - name: Phase 2a — Apply AKS (prerequisite for DNS VNet link)
+        run: |
+          terraform apply \
+            -target=module.loganalytics \
+            -target=module.aks \
+            -auto-approve \
+            -no-color \
+            2>&1 | tee aks-output.txt
+
+      # ── 6b. Phase 2b: Plan remaining resources ───────────────────────────
+      # AKS now exists, so data.azurerm_resources.aks_vnet resolves at plan
+      # time and the DNS VNet link count is concrete.
+      - name: Phase 2b — Plan
         run: |
           terraform plan \
             -no-color \
             -out=tfplan \
             2>&1 | tee plan-output.txt
 
-      # ── 7. Phase 2: Apply everything ────────────────────────────────────
-      # Apply all modules in dependency order (Terraform resolves the graph).
-      # -auto-approve skips the interactive "yes/no" prompt.
-      - name: Phase 2 — Apply all modules
+      # ── 7. Phase 2c: Apply everything ────────────────────────────────────
+      - name: Phase 2c — Apply all modules
         run: |
           terraform apply \
             -auto-approve \
