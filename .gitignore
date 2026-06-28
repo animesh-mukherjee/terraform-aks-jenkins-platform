@@ -33,10 +33,6 @@ override.tf.json
 .terraformrc
 terraform.rc
 
-# bootstrap.sh / destroy.sh temporarily park backend.tf under this name; if a run
-# is interrupted the sentinel may be left behind — never commit it.
-**/backend.tf.bootstrap-parked
-
 # =============================================================================
 # Kubernetes / Helm
 # =============================================================================
