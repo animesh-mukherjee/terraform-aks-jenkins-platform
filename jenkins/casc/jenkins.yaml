@@ -1,0 +1,93 @@
+# =============================================================================
+# jenkins/casc/jenkins.yaml
+#
+# JCasC file 1 of 6 — Jenkins system-level settings.
+#
+# Configures: system message, root URL, executor count, agent connection port,
+# CSRF protection, build discard policy, and markup formatter.
+#
+# Applied at startup: JCasC reads all YAML files in CASC_JENKINS_CONFIG
+# (/var/jenkins_home/casc_configs/) in alphabetical order. JCasC merges
+# keys across files; conflicting top-level keys cause a startup error.
+#
+# After changing this file:
+#   kubectl apply -k jenkins/casc/            # update the ConfigMap
+#   kubectl rollout restart deployment/jenkins -n jenkins  # reload JCasC
+# =============================================================================
+
+jenkins:
+  # Displayed as a banner on every Jenkins page — immediately visible to all
+  # users that this is a managed instance ("no manual config" reminder).
+  systemMessage: |
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║   AKS Jenkins Platform — KodeKloud Playground                      ║
+    ║   Managed entirely by JCasC — DO NOT configure via the UI.          ║
+    ║   All changes must be made in jenkins/casc/ and re-applied.         ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+
+  # Zero executors on the controller: no builds run here.
+  # All stages execute in pod agents on Node 2 (see jenkins/casc/clouds.yaml).
+  numExecutors: 0
+
+  # Quiet period: seconds Jenkins waits after a trigger fires before starting
+  # a build. 5 s gives GitHub webhooks time to deliver all related events
+  # (e.g. multiple commits pushed at once) so only one build is triggered.
+  quietPeriod: 5
+
+  # Retry SCM checkouts this many times before failing the build. Useful on
+  # KK where the Azure DevOps Git endpoint can time out on cold starts.
+  scmCheckoutRetryCount: 2
+
+  # ── Location ───────────────────────────────────────────────────────────────
+  # The root URL is used in:
+  #   - Webhook payloads sent back to GitHub (build status, coverage badges)
+  #   - "Build Now" links in emails and Slack messages
+  #   - CLI connection strings
+  # Must match the host in the NGINX Ingress (helm/jenkins/values.yaml).
+  location:
+    url: "http://jenkins.platform.internal"
+    adminAddress: "animeshmkhrj@gmail.com"
+
+  # ── Agent listener ─────────────────────────────────────────────────────────
+  # The JNLP port through which pod agents connect back to the controller.
+  # The Helm chart exposes this port via the `jenkins-agent` Service (ClusterIP).
+  # Must match jenkinsTunnel in jenkins/casc/clouds.yaml.
+  slaveAgentPort: 50000
+
+  # Protocol used for agent↔controller communication. JNLP4-connect uses
+  # a multiplexed binary protocol over TLS — more efficient than HTTP-based
+  # JNLP2. All pod agents (inbound-agent image) support JNLP4.
+  agentProtocols:
+    - "JNLP4-connect"
+
+  # ── CSRF protection ────────────────────────────────────────────────────────
+  # Crumb issuer prevents Cross-Site Request Forgery attacks on the Jenkins
+  # REST API. excludeClientIPFromCrumb: false means the crumb is tied to the
+  # client IP — set to true only if Jenkins is behind a proxy that changes
+  # the source IP (NGINX Ingress preserves the original IP via X-Real-IP).
+  crumbIssuer:
+    standard:
+      excludeClientIPFromCrumb: false
+
+  # ── Markup formatter ───────────────────────────────────────────────────────
+  # rawHtml allows HTML in job descriptions and build notes (useful for
+  # linking to Grafana/Blue Ocean). disableSyntaxHighlighting: true prevents
+  # the code editor from appearing in description fields.
+  markupFormatter:
+    rawHtml:
+      disableSyntaxHighlighting: true
+
+  # ── Global build discard policy ────────────────────────────────────────────
+  # Prevents disk exhaustion on the Jenkins PVC (10 Gi on KK).
+  # Individual jobs can override with their own discard policy.
+  globalNodeProperties: []
+
+# ── Tool auto-installation ────────────────────────────────────────────────────
+# JDK and Maven are NOT auto-installed here — tool installation is handled
+# inside the pod agent containers (which carry the right JDK and tools already).
+# Auto-install tools only make sense for long-lived permanent agent nodes.
+tool:
+  git:
+    installations:
+      - name: "Default"
+        home: "git"

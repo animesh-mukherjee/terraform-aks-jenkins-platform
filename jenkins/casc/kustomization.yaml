@@ -1,0 +1,59 @@
+# =============================================================================
+# jenkins/casc/kustomization.yaml
+#
+# Creates the `jenkins-casc-config` ConfigMap from the six JCasC YAML files
+# in this directory. The Jenkins pod mounts this ConfigMap at
+# /var/jenkins_home/casc_configs/ (configured in helm/jenkins/values.yaml).
+#
+# Apply (run AFTER helm/jenkins is deployed and the jenkins namespace exists):
+#   kubectl apply -k jenkins/casc/
+#
+# This command creates or updates the ConfigMap. If Jenkins is already running,
+# force a JCasC reload with:
+#   kubectl rollout restart deployment/jenkins -n jenkins
+#
+# Verify the ConfigMap was created:
+#   kubectl get configmap jenkins-casc-config -n jenkins -o yaml
+#
+# Verify all six files are keys in the ConfigMap data:
+#   kubectl get configmap jenkins-casc-config -n jenkins \
+#     -o jsonpath='{.data}' | python3 -m json.tool | grep '\.yaml'
+#
+# Ordering note:
+#   JCasC loads files alphabetically from the mounted directory:
+#   1. clouds.yaml      → Kubernetes cloud + pod templates
+#   2. credentials.yaml → Jenkins credential store
+#   3. jenkins.yaml     → System settings
+#   4. pipelines.yaml   → Multibranch pipeline job (requires credentials from 2)
+#   5. security.yaml    → Authorization strategy
+#   6. users.yaml       → Security realm + user accounts
+#   This order is fine — JCasC performs multiple resolution passes, so
+#   forward-references between files are resolved correctly.
+# =============================================================================
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# configMapGenerator creates a ConfigMap from files on disk.
+# Each file becomes a key in the ConfigMap's `data` field with the
+# filename as the key and the file contents as the value.
+# The ConfigMap is named jenkins-casc-config in the jenkins namespace.
+configMapGenerator:
+  - name: jenkins-casc-config
+    namespace: jenkins
+    files:
+      - clouds.yaml
+      - credentials.yaml
+      - jenkins.yaml
+      - pipelines.yaml
+      - security.yaml
+      - users.yaml
+    options:
+      # disableNameSuffixHash: true prevents kustomize from appending a
+      # content hash (e.g., jenkins-casc-config-7df6b9f) to the name.
+      # Without this, every `kubectl apply -k` creates a NEW ConfigMap with
+      # a different name, and the Jenkins pod still mounts the OLD one.
+      # Disabling the hash means the ConfigMap is always named exactly
+      # `jenkins-casc-config`, and the pod's volume reference never needs
+      # updating after a config change.
+      disableNameSuffixHash: true

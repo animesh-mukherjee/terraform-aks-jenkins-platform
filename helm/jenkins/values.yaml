@@ -1,0 +1,313 @@
+# =============================================================================
+# helm/jenkins/values.yaml
+#
+# Helm values for the official Jenkins chart (chart: jenkins/jenkins).
+#
+# Install command (run after k8s/rbac/ and k8s-post/ have been applied):
+#   helm repo add jenkins https://charts.jenkins.io
+#   helm repo update
+#   helm upgrade --install jenkins jenkins/jenkins \
+#     --namespace jenkins \
+#     --values helm/jenkins/values.yaml \
+#     --wait --timeout 10m
+#
+# Key architectural decisions encoded here:
+#   - controller.executors = 0  → all builds run on pod agents (never on controller)
+#   - Node 1 placement          → toleration for dedicated=controller:NoSchedule
+#                                  + affinity to avoid dedicated=agent nodes
+#   - JCasC                     → loaded from ConfigMap jenkins-casc-config
+#                                  (created by kustomize from jenkins/casc/*.yaml)
+#   - Admin credentials         → from K8s Secret jenkins-admin-credentials
+#                                  (created by terraform/k8s-post/)
+#   - ServiceAccount            → pre-existing jenkins-sa (k8s/rbac/)
+#   - imagePullSecret           → acr-pull-secret (k8s-post/) for ACR images
+# =============================================================================
+
+# ─── Controller ──────────────────────────────────────────────────────────────
+controller:
+
+  # Jenkins LTS image from Docker Hub (public — no imagePullSecret needed
+  # for the controller itself). JDK 17 is the current LTS requirement.
+  # Pin to a specific digest in production to prevent unexpected upgrades.
+  image:
+    repository: "jenkins/jenkins"
+    tag: "lts-jdk17"
+    pullPolicy: IfNotPresent
+
+  # ── Admin credentials ────────────────────────────────────────────────────
+  # The chart reads the admin username and password from this K8s Secret
+  # instead of generating new credentials. The Secret was created in
+  # terraform/k8s-post/ from random_password.jenkins_admin (Terraform state).
+  admin:
+    existingSecret: "jenkins-admin-credentials"
+    userKey: "jenkins-admin-user"
+    passwordKey: "jenkins-admin-password"
+    # Do NOT set admin.username or admin.password here — they are ignored
+    # when existingSecret is specified and leaving them unset prevents the
+    # chart from creating a second competing Secret.
+
+  # ── Executor count ────────────────────────────────────────────────────────
+  # Zero executors on the controller: no builds run here, only orchestration.
+  # Every build stage runs inside a dedicated pod agent on Node 2.
+  # This protects the controller from build-induced resource pressure and
+  # isolates build environments from each other.
+  numExecutors: 0
+
+  # ── Resource allocation ───────────────────────────────────────────────────
+  # Node 1: 4 vCPU / 8 GiB RAM
+  # Budget per docs/architecture.md:
+  #   kube-system:        ~0.3 CPU / 0.5 Gi
+  #   nginx-ingress:       0.1 CPU / 0.1 Gi
+  #   jenkins-controller:  1.5 CPU / 2.5 Gi  ← these values
+  #   Headroom:           ~2.1 CPU / 4.9 Gi ✅
+  resources:
+    requests:
+      cpu: "1500m"
+      memory: "2500Mi"
+    limits:
+      cpu: "2000m"
+      memory: "3Gi"
+
+  # ── JCasC (Jenkins Configuration as Code) ────────────────────────────────
+  # Disable the chart's built-in JCasC default config so our own ConfigMap
+  # is the sole source of truth. The chart's default config sets up a basic
+  # security realm; we replace it entirely via the mounted ConfigMap below.
+  JCasC:
+    defaultConfig: false
+
+  # ── Environment variables ──────────────────────────────────────────────────
+  # All variables here are referenced by JCasC as ${VAR_NAME} in credentials.yaml
+  # and users.yaml. Using individual secretKeyRef entries (rather than envFrom)
+  # avoids depending on the chart supporting bulk secret mounts.
+  #
+  # Sources:
+  #   jenkins-admin-credentials  — created by terraform/k8s-post/ (admin password)
+  #   jenkins-pipeline-creds     — created by terraform/k8s-post/ (ACR + PostgreSQL)
+  #   service-bus-credentials    — created by terraform/k8s-post/ (Service Bus SAS)
+  containerEnv:
+    - name: CASC_JENKINS_CONFIG
+      value: /var/jenkins_home/casc_configs
+
+    # Admin password — referenced in jenkins/casc/users.yaml as ${JENKINS_ADMIN_PASSWORD}
+    - name: JENKINS_ADMIN_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: jenkins-admin-credentials
+          key: jenkins-admin-password
+
+    # ACR credentials — referenced in jenkins/casc/credentials.yaml
+    - name: ACR_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: jenkins-pipeline-creds
+          key: ACR_USERNAME
+    - name: ACR_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: jenkins-pipeline-creds
+          key: ACR_PASSWORD
+    - name: ACR_LOGIN_SERVER
+      valueFrom:
+        secretKeyRef:
+          name: jenkins-pipeline-creds
+          key: ACR_LOGIN_SERVER
+
+    # PostgreSQL connection string — referenced in jenkins/casc/credentials.yaml
+    - name: POSTGRESQL_CONNECTION_STRING
+      valueFrom:
+        secretKeyRef:
+          name: jenkins-pipeline-creds
+          key: POSTGRESQL_CONNECTION_STRING
+
+    # Service Bus SAS — referenced in jenkins/casc/credentials.yaml
+    - name: SERVICE_BUS_CONNECTION_STRING
+      valueFrom:
+        secretKeyRef:
+          name: service-bus-credentials
+          key: SERVICE_BUS_CONNECTION_STRING
+
+    # ACI name + resource group — used in Jenkinsfile.build Stage 4 (DB migration)
+    - name: RESOURCE_GROUP_NAME
+      valueFrom:
+        secretKeyRef:
+          name: jenkins-pipeline-creds
+          key: RESOURCE_GROUP_NAME
+    - name: ACI_NAME
+      valueFrom:
+        secretKeyRef:
+          name: jenkins-pipeline-creds
+          key: ACI_NAME
+
+  # ── JCasC ConfigMap mount ─────────────────────────────────────────────────
+  # jenkins-casc-config is a ConfigMap created from the six files in
+  # jenkins/casc/ via kustomize (see jenkins/casc/kustomization.yaml in Step 16).
+  # Mounting as readOnly prevents Jenkins from writing back to the ConfigMap.
+  extraVolumes:
+    - name: casc-config
+      configMap:
+        name: jenkins-casc-config
+
+  extraVolumeMounts:
+    - name: casc-config
+      mountPath: /var/jenkins_home/casc_configs
+      readOnly: true
+
+  # ── Plugins ───────────────────────────────────────────────────────────────
+  # Format: "plugin-id:version"
+  # IMPORTANT: verify these versions against https://plugins.jenkins.io before
+  # deploying. Plugin versions change frequently; pinning prevents unexpected
+  # upgrades mid-session. The init container downloads and installs these on
+  # first start — a slow connection on KK may add 3-5 minutes to startup.
+  #
+  # Do NOT set additionalPlugins — it merges with this list and can cause
+  # version conflicts. List everything here.
+  installPlugins:
+    # Core pipeline execution
+    - kubernetes:4200.v7ac2db_d19f3a           # Dynamic pod agents on AKS
+    - workflow-aggregator:596.v8c21c963d92d    # Pipeline (Scripted + Declarative)
+    - git:5.2.2                                # Git SCM checkout
+    - github-branch-source:1729.v4f55e5d56b_f1 # Multibranch from GitHub
+
+    # Configuration as Code
+    - configuration-as-code:1810.v9b_c30a_249a_4c # JCasC — reads casc_configs/
+
+    # Security and credentials
+    - matrix-auth:3.2.2                        # Matrix authorization (admin/dev/viewer)
+    - credentials:1369.vb_24e243e3ad3          # Core credentials store
+    - credentials-binding:677.vdc24b_eca_306b  # withCredentials{} in Jenkinsfiles
+
+    # Pipeline UX + job definition
+    - pipeline-stage-view:2.34                 # Stage view in classic UI
+    - blueocean:1.27.14                        # Blue Ocean modern UI
+    - pipeline-graph-analysis:202.va_d268e64deb_3 # Build analysis support
+    - job-dsl:1.87                             # Defines jobs in JCasC via Groovy DSL
+
+    # Build utilities
+    - timestamper:1.26                         # Prepend timestamps to console output
+    - ws-cleanup:0.46                          # Post-build workspace cleanup
+    - ansicolor:1.0.4                          # Colour ANSI escape codes in logs
+
+  # ── ServiceAccount ────────────────────────────────────────────────────────
+  # Use the pre-existing jenkins-sa created by k8s/rbac/.
+  # Setting create: false tells the chart not to create its own SA.
+  serviceAccount:
+    create: false
+    name: jenkins-sa
+
+  # ── Node placement — Node 1 (controller node) ─────────────────────────────
+  # Node 1 carries taint: dedicated=controller:NoSchedule
+  # Node 2 carries label: dedicated=agent
+  #
+  # Strategy: tolerate the Node 1 taint (allows scheduling there)
+  # + affinity to avoid Node 2 (labeled dedicated=agent).
+  # Together these pin the controller to Node 1 without needing a
+  # dedicated=controller label on Node 1 itself.
+  tolerations:
+    - key: "dedicated"
+      operator: "Equal"
+      value: "controller"
+      effect: "NoSchedule"
+
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: "dedicated"
+                operator: "NotIn"
+                values:
+                  - "agent"
+
+  # ── Persistence ────────────────────────────────────────────────────────────
+  # Jenkins home directory holds job configs, build history, plugins, and
+  # workspace caches. 10 Gi is sufficient for the KK playground session.
+  # storageClass "" uses the cluster's default (Standard_LRS on KK AKS).
+  # PROD: increase to 50+ Gi; consider a dedicated storage class with
+  # backups enabled.
+  persistence:
+    enabled: true
+    storageClass: ""          # "" = cluster default (Standard_LRS on KK)
+    accessMode: ReadWriteOnce # Azure Disk supports RWO only
+    size: "10Gi"
+
+  # ── Service ────────────────────────────────────────────────────────────────
+  # ClusterIP: Jenkins is not exposed directly — all traffic flows through
+  # the NGINX Ingress controller (see ingress block below).
+  # The agent JNLP port (50000) is handled by a separate service (agentListenerService).
+  serviceType: ClusterIP
+  servicePort: 8080
+
+  # ── Ingress ───────────────────────────────────────────────────────────────
+  # NGINX Ingress routes jenkins.platform.internal → jenkins:8080.
+  # The private DNS zone (module.dns) resolves this FQDN for pods inside the
+  # cluster. After NGINX gets its external IP (post-Helm), a DNS A record is
+  # added to the private zone in k8s-post/.
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hostName: jenkins.platform.internal
+    annotations:
+      # Allow large file uploads (Maven artifacts, Docker layer caches)
+      nginx.ingress.kubernetes.io/proxy-body-size: "0"
+      # Long-running Declarative Pipeline HTTP polling from Blue Ocean
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+
+  # ── Jenkins root URL ──────────────────────────────────────────────────────
+  # Used for webhook callbacks, CLI connections, and build badge links.
+  # JCasC also sets this via jenkins.location.url in jenkins/casc/jenkins.yaml.
+  jenkinsUrl: "http://jenkins.platform.internal"
+
+  # ── imagePullSecrets ──────────────────────────────────────────────────────
+  # The Jenkins controller image is from Docker Hub (public) — no pull secret
+  # needed. The acr-pull-secret is referenced in pod agent templates via JCasC
+  # (jenkins/casc/clouds.yaml), not here.
+  imagePullSecretName: ""
+
+# ─── Agent ────────────────────────────────────────────────────────────────────
+# Default settings for pod agents created by the Kubernetes plugin.
+# Specific agent pod templates (nodejs-agent, helm-agent, db-agent) are
+# defined in JCasC (jenkins/casc/clouds.yaml), not here. These defaults
+# apply to any agent not covered by a named template.
+agent:
+  # Pod agents run in the jenkins namespace so they share the imagePullSecret
+  # and service account already set up there.
+  namespace: jenkins
+
+  # Default agent image — a minimal JNLP agent that can run shell commands.
+  # Project-specific agents (nodejs-agent etc.) override this in clouds.yaml.
+  image:
+    repository: "jenkins/inbound-agent"
+    tag: "latest-jdk17"
+
+  # Node 2 placement: agents must NOT go to the controller node.
+  # Node 2 is labeled dedicated=agent; we use nodeSelector to target it.
+  # No toleration needed — Node 2 has no taint (Node 1 does).
+  nodeSelector:
+    dedicated: "agent"
+
+  # Default agent resource allocation.
+  # Each agent pod is a short-lived container that exits after the build.
+  # Three agents can run simultaneously on Node 2 (4 CPU / 8 Gi) with this budget.
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+
+  # Pod agents are always created on-demand — never kept warm.
+  idleMinutes: 0
+
+  # Image pull secret for agents pulling from ACR.
+  # This covers the default inbound-agent image which is from Docker Hub,
+  # but project agents (nodejs-agent etc.) need it for ACR images.
+  imagePullSecretName: "acr-pull-secret"
+
+# ─── NGINX Ingress Controller (sub-chart) ─────────────────────────────────────
+# The Jenkins chart can optionally deploy NGINX ingress. On KK we install
+# NGINX separately (via its own Helm release) to keep ingress lifecycle
+# independent of Jenkins upgrades. Disable it here.
+nginx-ingress-controller:
+  enabled: false

@@ -1,0 +1,212 @@
+# =============================================================================
+# .github/workflows/tf-plan.yml
+#
+# Runs `terraform plan` on every pull request that touches Terraform files.
+# Posts the plan diff as a PR comment so reviewers can see exactly what
+# Azure resources will change before approving the merge.
+#
+# ── Required GitHub Secrets ───────────────────────────────────────────────────
+# Set these in: GitHub repo → Settings → Secrets and variables → Actions
+#
+#   ARM_CLIENT_ID           KK service principal client ID
+#   ARM_CLIENT_SECRET       KK service principal client secret
+#   ARM_SUBSCRIPTION_ID     KK subscription ID
+#   ARM_TENANT_ID           KK tenant ID (Directory ID)
+#   RESOURCE_GROUP_NAME     KK-provided resource group (e.g. "Regroup_12345")
+#   STORAGE_ACCOUNT_NAME    Terraform backend storage account
+#                           (set AFTER first `terraform apply` of the storage module)
+#   TF_VAR_PREFIX           Your prefix variable (e.g. "animesh")
+#
+# IMPORTANT — KK session rotation:
+#   KK credentials change every session. After starting a new KK session,
+#   update ARM_CLIENT_ID, ARM_CLIENT_SECRET, ARM_SUBSCRIPTION_ID, ARM_TENANT_ID
+#   in GitHub Secrets before pushing any Terraform changes.
+#   RESOURCE_GROUP_NAME and STORAGE_ACCOUNT_NAME are stable within a session.
+#
+# ── Security note ─────────────────────────────────────────────────────────────
+# The `pull_request` trigger does NOT expose secrets to PRs from forks.
+# This is fine for a single-user repo (all PRs are from the same account).
+# If you open this repo to external contributors, consider using
+# `pull_request_target` with explicit security controls.
+# =============================================================================
+
+name: Terraform Plan
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "terraform/**"
+      - ".github/workflows/tf-plan.yml"
+  # Allow manual triggers for ad-hoc plan checks without a PR.
+  workflow_dispatch:
+
+# Least-privilege permissions:
+#   contents: read   — checkout the repo
+#   pull-requests: write — post plan output as a PR comment
+permissions:
+  contents:      read
+  pull-requests: write
+
+jobs:
+  plan:
+    name: terraform plan
+    runs-on: ubuntu-latest
+
+    # ── Azure credentials ───────────────────────────────────────────────────
+    # Terraform reads ARM_* env vars for Azure authentication (service principal).
+    # TF_VAR_* env vars are picked up automatically as Terraform input variables.
+    env:
+      ARM_CLIENT_ID:                  ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:              ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID:            ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID:                  ${{ secrets.ARM_TENANT_ID }}
+      TF_VAR_resource_group_name:     ${{ secrets.RESOURCE_GROUP_NAME }}
+      TF_VAR_prefix:                  ${{ secrets.TF_VAR_PREFIX }}
+      # Run in automation mode: no interactive prompts, no color codes in output.
+      TF_INPUT:                       "false"
+      TF_IN_AUTOMATION:               "true"
+
+    defaults:
+      run:
+        working-directory: terraform/
+
+    steps:
+
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Setup Terraform ───────────────────────────────────────────────
+      # wrapper: true wraps terraform calls to capture stdout/stderr in
+      # GitHub Actions output variables (steps.*.outputs.stdout etc.).
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.9"
+          terraform_wrapper: true
+
+      # ── 3. Terraform Init ────────────────────────────────────────────────
+      # -backend-config passes the dynamic values that are NOT hardcoded in
+      # terraform/backend.tf (resource_group_name, storage_account_name).
+      # These are safe to pass here because they are non-sensitive identifiers.
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.RESOURCE_GROUP_NAME }}" \
+            -backend-config="storage_account_name=${{ secrets.STORAGE_ACCOUNT_NAME }}" \
+            -reconfigure \
+            -no-color
+
+      # ── 4. Terraform Validate ────────────────────────────────────────────
+      # Validate HCL syntax and internal consistency WITHOUT contacting Azure.
+      # This catches type errors, missing required fields, and unknown resources
+      # before any API calls are made.
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      # ── 5. Terraform Plan ─────────────────────────────────────────────────
+      # continue-on-error: true — let the workflow continue so the plan output
+      # can be posted to the PR even when the plan contains errors.
+      # The final step re-checks the exit code and fails the job if non-zero.
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -no-color \
+            -out=tfplan \
+            2>&1 | tee plan-output.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      # ── 6. Post plan output as PR comment ─────────────────────────────────
+      # Posts the full plan (truncated to 65 000 chars — GitHub comment limit)
+      # as a collapsible <details> block. Re-uses the same PR comment thread
+      # on subsequent pushes to the same PR branch (find + update pattern).
+      - name: Post plan comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN_OUTPUT: ${{ steps.plan.outputs.stdout }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            // Read plan output captured by terraform_wrapper.
+            // Fall back to the tee'd file if wrapper output is empty.
+            let plan = process.env.PLAN_OUTPUT ||
+                       fs.readFileSync('terraform/plan-output.txt', 'utf8');
+
+            // Truncate to avoid exceeding GitHub's 65 536-char comment limit.
+            const MAX = 60000;
+            if (plan.length > MAX) {
+              plan = plan.slice(0, MAX) +
+                '\n\n⚠️ Plan output truncated — see Actions log for full output.';
+            }
+
+            const outcome  = '${{ steps.plan.outcome }}';
+            const emoji    = outcome === 'success' ? '✅' : '❌';
+            const initOut  = '${{ steps.init.outcome }}';
+            const valOut   = '${{ steps.validate.outcome }}';
+
+            const body = [
+              '## Terraform Plan',
+              '',
+              `| Step | Status |`,
+              `|---|---|`,
+              `| Init     | ${initOut === 'success' ? '✅' : '❌'} ${initOut} |`,
+              `| Validate | ${valOut  === 'success' ? '✅' : '❌'} ${valOut}  |`,
+              `| Plan     | ${emoji} ${outcome} |`,
+              '',
+              '<details>',
+              '<summary>Show Plan Output</summary>',
+              '',
+              '```',
+              plan,
+              '```',
+              '',
+              '</details>',
+              '',
+              `*Commit: \`${{ github.sha }}\` · Branch: \`${{ github.head_ref }}\`*`,
+            ].join('\n');
+
+            // Find a previous plan comment by this workflow to update instead
+            // of posting a new comment on every push to the PR branch.
+            const MARKER = '## Terraform Plan';
+            const comments = await github.rest.issues.listComments({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.data.find(c =>
+              c.user.type === 'Bot' && c.body.startsWith(MARKER)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      # ── 7. Fail the job if plan failed ────────────────────────────────────
+      # This step runs AFTER the PR comment is posted so reviewers always see
+      # the plan output, even when the plan itself has errors.
+      - name: Fail on plan error
+        if: steps.plan.outputs.exitcode != '0'
+        run: |
+          echo "Terraform plan exited with code ${{ steps.plan.outputs.exitcode }}"
+          exit 1

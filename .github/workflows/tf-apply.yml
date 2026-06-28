@@ -1,0 +1,177 @@
+# =============================================================================
+# .github/workflows/tf-apply.yml
+#
+# Runs `terraform apply` when Terraform changes are merged to main, or on
+# manual trigger (workflow_dispatch).
+#
+# ── Two-phase apply strategy (mirrors bootstrap.sh) ──────────────────────────
+# Phase 1: apply the storage module only (creates the backend storage account)
+# Phase 2: migrate state to the remote backend, then apply everything
+#
+# This matches the bootstrap.sh workflow documented in docs/kk-session-guide.md.
+# On the FIRST run of a new KK session, Phase 1 is required. On subsequent
+# runs within the same session, the backend already exists and Phase 1 is a
+# no-op (Terraform detects no changes to the storage module).
+#
+# ── Approval gate ─────────────────────────────────────────────────────────────
+# The job targets the `production` GitHub Actions environment. Configure that
+# environment in: GitHub repo → Settings → Environments → production
+#   - Required reviewers: your GitHub username
+#   - This adds a manual approval step before `terraform apply` runs.
+#   - Without the environment protection rule, apply runs automatically on merge.
+#
+# ── Required GitHub Secrets ───────────────────────────────────────────────────
+# Same secrets as tf-plan.yml. See that file's header for the full list.
+# Update ARM_* credentials at the start of every KK session.
+# =============================================================================
+
+name: Terraform Apply
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "terraform/**"
+      - ".github/workflows/tf-apply.yml"
+  # Manual trigger — useful for applying during a KK session without
+  # pushing a new commit (e.g., after updating GitHub Secrets with new
+  # KK credentials).
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for manual apply"
+        required: false
+        default:  "Manual apply"
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    name: terraform apply
+    runs-on: ubuntu-latest
+
+    # The `production` environment enforces the manual approval gate.
+    # Remove this line if you want apply to run automatically on every merge.
+    environment: production
+
+    env:
+      ARM_CLIENT_ID:              ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:          ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID:        ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID:              ${{ secrets.ARM_TENANT_ID }}
+      TF_VAR_resource_group_name: ${{ secrets.RESOURCE_GROUP_NAME }}
+      TF_VAR_prefix:              ${{ secrets.TF_VAR_PREFIX }}
+      TF_INPUT:                   "false"
+      TF_IN_AUTOMATION:           "true"
+
+    defaults:
+      run:
+        working-directory: terraform/
+
+    steps:
+
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Setup Terraform ───────────────────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.9"
+          terraform_wrapper: false  # no wrapper in apply — we handle output ourselves
+
+      # ── 3. Phase 1: Init with local backend ──────────────────────────────
+      # On the very first run of a new KK session, the remote backend does not
+      # yet exist. We initialise with a local backend to apply the storage
+      # module first, then migrate.
+      #
+      # -backend=false skips remote backend configuration entirely — Terraform
+      # keeps state in memory only. This is safe for Phase 1 because the only
+      # resource being created is the storage account itself.
+      - name: Phase 1 — Init (local backend)
+        run: terraform init -backend=false -no-color
+
+      # ── 4. Phase 1: Apply storage module only ────────────────────────────
+      # Applies only module.storage — creates the storage account and container
+      # that the remote backend needs. -target restricts apply to one module.
+      #
+      # `|| true` — if the storage account already exists from a previous run,
+      # this apply is a no-op and exits 0. The `|| true` handles the edge case
+      # where Terraform can't init the module at all (stale .terraform/ dir).
+      - name: Phase 1 — Apply storage module
+        run: |
+          terraform apply \
+            -target=module.storage \
+            -auto-approve \
+            -no-color \
+            2>&1 | tee phase1-output.txt || true
+
+          # Extract the storage account name from outputs for Phase 2.
+          STORAGE_ACCOUNT=$(terraform output -raw storage_account_name 2>/dev/null || echo "")
+          echo "STORAGE_ACCOUNT_NAME=${STORAGE_ACCOUNT}" >> "$GITHUB_ENV"
+          echo "Storage account: ${STORAGE_ACCOUNT}"
+
+      # ── 5. Phase 2: Re-init with remote backend ───────────────────────────
+      # Now that the storage account exists, re-initialise with the remote
+      # backend. -migrate-state moves Phase 1's local state into the backend.
+      # -force-copy skips the interactive "move state?" prompt.
+      - name: Phase 2 — Init (remote backend)
+        run: |
+          # Use the storage account discovered in Phase 1, falling back to the
+          # GitHub Secret (set by the user after the first session bootstrap).
+          STORAGE="${STORAGE_ACCOUNT_NAME:-${{ secrets.STORAGE_ACCOUNT_NAME }}}"
+
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.RESOURCE_GROUP_NAME }}" \
+            -backend-config="storage_account_name=${STORAGE}" \
+            -migrate-state \
+            -force-copy \
+            -no-color
+
+      # ── 6. Phase 2: Plan (for log visibility) ────────────────────────────
+      # Run a plan before apply so the Actions log shows exactly what will
+      # change. The plan output is not posted as a comment here (this job
+      # runs on merge, not on PR — no PR context available).
+      - name: Phase 2 — Plan
+        run: |
+          terraform plan \
+            -no-color \
+            -out=tfplan \
+            2>&1 | tee plan-output.txt
+
+      # ── 7. Phase 2: Apply everything ────────────────────────────────────
+      # Apply all modules in dependency order (Terraform resolves the graph).
+      # -auto-approve skips the interactive "yes/no" prompt.
+      - name: Phase 2 — Apply all modules
+        run: |
+          terraform apply \
+            -auto-approve \
+            tfplan \
+            -no-color \
+            2>&1 | tee apply-output.txt
+
+      # ── 8. Print key outputs ─────────────────────────────────────────────
+      # Surface the most useful outputs in the Actions log so you can copy
+      # them without running `terraform output` locally.
+      - name: Print outputs
+        if: always()
+        run: |
+          echo "=== Key Terraform Outputs ==="
+          terraform output -no-color 2>/dev/null || echo "(outputs unavailable)"
+
+      # ── 9. Upload plan and apply logs as artifacts ───────────────────────
+      # Retain the plan + apply output for 7 days so you can audit what
+      # changed without needing to re-run. Matches the KK session lifetime.
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-logs-${{ github.run_number }}
+          path: |
+            terraform/plan-output.txt
+            terraform/apply-output.txt
+            terraform/phase1-output.txt
+          retention-days: 7

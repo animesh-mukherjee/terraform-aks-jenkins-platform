@@ -1,0 +1,85 @@
+# =============================================================================
+# app-sample/helm/app-chart/values.yaml
+#
+# Default values for the platform sample app Helm chart.
+#
+# Values overridden by Jenkinsfile.build Stages 5 and 9 via --set:
+#   image.repository  — <acr>.azurecr.io/platform-sample-app
+#   image.tag         — <8-char-git-sha>
+#   ingress.host      — app.dev.platform.internal  (dev)
+#                       app.staging.platform.internal (staging)
+#
+# The release name used by all Jenkinsfiles is `platform-sample-app`.
+# fullnameOverride ensures the K8s Service name matches APP_NAME in the
+# Jenkinsfiles, making the smoke-test ClusterIP URL predictable:
+#   http://platform-sample-app.<namespace>.svc.cluster.local:3000/health
+# =============================================================================
+
+# fullnameOverride pins the K8s resource names to exactly this string,
+# regardless of the Helm release name. Required because the default fullname
+# template would produce "platform-sample-app-app-chart" (ugly and fragile).
+fullnameOverride: "platform-sample-app"
+
+replicaCount: 1
+
+image:
+  # repository and tag are always set via `--set` by Jenkinsfile — these
+  # defaults are only used for local development (`helm template`).
+  repository: "jenkins/jenkins"  # placeholder — always overridden by Jenkins
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+# imagePullSecrets: reference the ACR pull secret created by terraform/k8s-post/.
+# Pods cannot pull images from ACR without this.
+imagePullSecrets:
+  - name: acr-pull-secret
+
+service:
+  type: ClusterIP
+  # Expose port 3000 (the container's native port) directly on the Service.
+  # No port translation needed; NGINX Ingress routes external 80 → Service 3000.
+  port: 3000
+
+ingress:
+  enabled: true
+  ingressClassName: nginx
+  # host is always overridden by Jenkins: --set ingress.host=app.dev.platform.internal
+  host: "app.dev.platform.internal"
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+
+# Resource allocation for app pods on Node 2 (4 vCPU / 8 Gi).
+# The budget is conservative — three agent pods may run simultaneously.
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "256Mi"
+
+# Probe settings — tuned for a Node.js app with PostgreSQL dependency.
+# initialDelaySeconds: allow the PG connection pool to initialise before
+# the first readiness check (DB on Azure may take 2-3 s to respond).
+probes:
+  readiness:
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    failureThreshold: 3
+  liveness:
+    initialDelaySeconds: 20
+    periodSeconds: 10
+    failureThreshold: 3
+
+# Feature flags — injected into the pod as env vars via the ConfigMap template.
+# Override with `--set featureFlags.darkMode=true` in Jenkins or helm CLI.
+featureFlags:
+  darkMode:    false
+  newUserFlow: false
+
+# App runtime config — also injected via ConfigMap.
+appConfig:
+  environment:       "dev"
+  logLevel:          "info"
+  maxDbConnections:  "5"

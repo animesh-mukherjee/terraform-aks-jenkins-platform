@@ -1,141 +1,235 @@
 # Architecture
 
-This document details the platform architecture: the Azure resource topology, the AKS
-node strategy and resource budget, the two layers of RBAC, and the end-to-end CI/CD
-data flow.
-
-> All resources live inside the **KodeKloud-provided resource group** in **eastus**.
-> No resource group is ever created by this project.
+AKS Jenkins Platform — complete system design for the KodeKloud Azure Playground.
 
 ---
 
-## 1. Azure resource topology
+## High-level diagram
 
-| # | Resource | SKU / Tier | Role in the platform |
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Developer Workstation                                                  │
+│   git push / PR → GitHub                                                │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                │
+                    ┌───────────▼────────────┐
+                    │    GitHub Repository    │
+                    │  terraform-aks-jenkins  │
+                    │  ─────────────────────  │
+                    │  PR  → tf-plan.yml      │
+                    │  main → tf-apply.yml    │
+                    └───────────┬────────────┘
+                                │ terraform apply
+                                ▼
+┌───────────────────── Azure (KodeKloud Subscription) ───────────────────┐
+│                                                                         │
+│  ┌──────────────┐   ┌──────────┐   ┌─────────────┐   ┌─────────────┐  │
+│  │ Storage Acct │   │   ACR    │   │  Key Vault  │   │ Log Analytics│  │
+│  │ (tfstate)    │   │ (images) │   │ (secrets)   │   │ (AKS logs)  │  │
+│  └──────────────┘   └────┬─────┘   └──────┬──────┘   └──────┬──────┘  │
+│                          │                │                  │          │
+│  ┌────────────────────── AKS Cluster ─────────────────────────────────┐ │
+│  │                                                                     │ │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │ │
+│  │  │  Node 1  taint: dedicated=controller:NoSchedule              │  │ │
+│  │  │                                                              │  │ │
+│  │  │  ┌──────────────────────┐  ┌───────────────────────┐        │  │ │
+│  │  │  │  Jenkins Controller  │  │   NGINX Ingress        │        │  │ │
+│  │  │  │  1.5 CPU / 2.5 Gi   │  │   0.1 CPU / 0.1 Gi    │        │  │ │
+│  │  │  └──────────────────────┘  └───────────────────────┘        │  │ │
+│  │  └──────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                     │ │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │ │
+│  │  │  Node 2  label: dedicated=agent                              │  │ │
+│  │  │                                                              │  │ │
+│  │  │  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐  │  │ │
+│  │  │  │ nodejs-agent │  │  helm-agent  │  │  app pod (dev/    │  │  │ │
+│  │  │  │ (ephemeral)  │  │  (ephemeral) │  │  staging ns)      │  │  │ │
+│  │  │  │ node:18      │  │ helm-kubectl │  │  Express + pg     │  │  │ │
+│  │  │  │ + dind scar  │  │              │  │                   │  │  │ │
+│  │  │  └──────────────┘  └──────────────┘  └───────────────────┘  │  │ │
+│  │  └──────────────────────────────────────────────────────────────┘  │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────┐   │
+│  │  PostgreSQL  │  │ Service Bus  │  │ App Config   │  │   ACI    │   │
+│  │  Flex Server │  │  (Basic)     │  │  (Free)      │  │ migrator │   │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────┘   │
+│                                                                         │
+│  ┌──────────────────────────────────────────┐                          │
+│  │  Private DNS Zone: platform.internal     │                          │
+│  │  jenkins.platform.internal → ClusterIP   │                          │
+│  └──────────────────────────────────────────┘                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Component inventory
+
+| # | Component | Terraform module | Purpose |
 |---|---|---|---|
-| 1 | Storage Account | Standard_LRS | Terraform remote-state backend |
-| 2 | Container Registry (ACR) | Standard, `admin_enabled=true` | Docker image store for app builds |
-| 3 | Key Vault | Standard | All secrets (jenkins-admin, acr creds, postgres password) |
-| 4 | Log Analytics Workspace | PerGB2018, 30d | AKS Container Insights |
-| 5 | AKS Cluster | 1 pool · 2× Standard_D2s_v3 | Runs Jenkins controller, pod agents, app namespaces |
-| 6 | PostgreSQL Flexible Server | Burstable B1ms | Sample-app database |
-| 7 | Service Bus Namespace | Basic (queues only) | Build/deploy event notifications |
-| 8 | App Configuration | Free | App feature flags / runtime config |
-| 9 | Private DNS Zone | `platform.internal` | Internal service discovery |
-| 10 | Container Instance (ACI) | Standard, one-shot | DB migration runner invoked by the pipeline |
-
-**Provisioning order** is enforced by Terraform's dependency graph and made explicit
-with `depends_on`: storage (state) → ACR / Key Vault / Log Analytics → AKS → data
-services (PostgreSQL, Service Bus, App Config, DNS) → k8s-post (secrets, namespaces).
+| 1 | Storage Account (Standard_LRS) | `modules/storage` | Terraform remote state backend (tfstate container) |
+| 2 | Container Registry (Standard) | `modules/acr` | Docker image store for app + migration images |
+| 3 | Key Vault (Standard) | `modules/keyvault` | Secrets: jenkins-admin-password, acr-username, acr-password, postgresql-password |
+| 4 | Log Analytics Workspace (PerGB2018) | `modules/loganalytics` | AKS Container Insights; retention 30 days |
+| 5 | AKS Cluster (kubenet) | `modules/aks` | 1 node pool, 2× Standard_D2s_v3 (4 vCPU / 8 Gi each) |
+| 6 | PostgreSQL Flexible Server (B1ms) | `modules/postgresql` | App database: `appdb` |
+| 7 | Service Bus Namespace (Basic) | `modules/servicebus` | Build/deploy event queues: `build-events`, `deploy-events` |
+| 8 | App Configuration (Free) | `modules/appconfig` | Feature flags: `dark-mode`, `new-user-flow` |
+| 9 | Private DNS Zone | `modules/dns` | `platform.internal` — internal service discovery |
+| 10 | Container Instance (one-shot) | `modules/aci` | DB migration runner — Jenkins Stage 4 |
 
 ---
 
-## 2. AKS node strategy
-
-The cluster has exactly **2 nodes** (sandbox cap). We split responsibilities by
-**tainting Node 1** and **labelling Node 2**, so Jenkins controller workloads never
-compete with build agents for resources.
-
-| Node | Marker | Hosts |
-|---|---|---|
-| **Node 1** | taint `dedicated=controller:NoSchedule` | Jenkins Controller + NGINX Ingress |
-| **Node 2** | label `dedicated=agent` | Ephemeral Jenkins pod agents (nodejs / helm / db) |
-
-- The controller and ingress **tolerate** the Node 1 taint and use a `nodeSelector`
-  to pin there. Nothing else schedules onto Node 1 because of `NoSchedule`.
-- Pod agents use a `nodeSelector` of `dedicated=agent` to land on Node 2.
-
-### Resource budget
-
-Each `Standard_D2s_v3` node = **2 vCPU / 8 GiB** allocatable-ish (the headroom figures
-below assume the ~4 vCPU logical scheduling Jenkins requests against; values are tuned
-so requests always fit).
+## AKS two-node strategy
 
 ```
-Node 1 (controller):
-  kube-system               ~0.3 CPU / 0.5 Gi
-  nginx-ingress              0.1 CPU / 0.1 Gi
-  jenkins-controller         1.5 CPU / 2.5 Gi   (limit 2 CPU / 3 Gi)
-  → headroom retained for burst
+                    4 vCPU / 8 Gi RAM each
+┌──────────────────────────────────────────────┐
+│  Node 1  taint: dedicated=controller:NoSchedule │
+│                                              │
+│  kube-system daemonsets:  ~0.3 CPU / 0.5 Gi  │
+│  NGINX Ingress Controller: 0.1 CPU / 0.1 Gi  │
+│  Jenkins Controller:       1.5 CPU / 2.5 Gi  │
+│  ────────────────────────────────────────     │
+│  Headroom:                ~2.1 CPU / 4.9 Gi  │
+└──────────────────────────────────────────────┘
 
-Node 2 (agents):
-  kube-system daemonsets    ~0.1 CPU / 0.2 Gi
-  up to 3 pod agents        ~1.6 CPU / 3.5 Gi
-  → headroom retained for burst
+┌──────────────────────────────────────────────┐
+│  Node 2  label: dedicated=agent              │
+│                                              │
+│  kube-system daemonsets:  ~0.1 CPU / 0.2 Gi  │
+│  app pod (long-running):   0.1 CPU / 0.1 Gi  │
+│  up to 3 agent pods:      ~1.6 CPU / 3.5 Gi  │
+│  ────────────────────────────────────────     │
+│  Headroom:                ~2.2 CPU / 4.2 Gi  │
+└──────────────────────────────────────────────┘
 ```
 
-Every pod spec sets **both `requests` and `limits`** (project standard) so the
-scheduler can honor this budget deterministically.
+**Placement mechanism:**
+- The **taint** on Node 1 (`dedicated=controller:NoSchedule`) prevents any pod from landing there unless the pod spec includes a matching `toleration`. Only the Jenkins controller and NGINX Ingress carry this toleration.
+- The **label** on Node 2 (`dedicated=agent`) is the `nodeSelector` target for all Jenkins agent pod templates and the app deployment. No pod is *forced* to Node 2 — it is the only node that doesn't have the controller taint, so pods without the toleration schedule there naturally.
+- Taints and labels are applied by `null_resource.node_placement` in `terraform/k8s-post/main.tf` using `az aks command invoke`. The oldest node (by `creationTimestamp`) becomes Node 1.
 
 ---
 
-## 3. Two layers of RBAC
+## Kubernetes namespace layout
 
-Because Azure IAM role assignments are blocked, access control is expressed in
-**Kubernetes RBAC** (for cluster access) and **Jenkins matrix auth** (for CI/CD access).
+```
+kube-system   — AKS system components (CoreDNS, kube-proxy, omsagent)
+jenkins       — Jenkins controller + ephemeral agent pods + K8s secrets
+dev           — sample app (Helm release: platform-sample-app)
+staging       — sample app after promotion through the approval gate
+```
 
-### Jenkins RBAC (JCasC matrix authorization — not Entra SSO)
+---
+
+## Pipeline data flow
+
+```
+GitHub push / PR
+      │
+      ▼
+Multibranch Pipeline (Jenkins — Jenkinsfile.build)
+      │
+      ├─ Stage 1: Checkout + Lint      nodejs-agent pod (Node 2)
+      ├─ Stage 2: Unit Tests           nodejs-agent pod (Node 2)
+      ├─ Stage 3: Docker Build + Push  nodejs-agent + DinD sidecar (Node 2)
+      │               └──► ACR: platform-sample-app:<sha>
+      │               └──► ACR: platform-sample-app-migrations:<sha>
+      │
+      ├─ Stage 4: DB Migration         helm-agent pod (Node 2)
+      │               └──► az container create (ACI, one-shot)
+      │                       └──► migrate.js → PostgreSQL (appdb)
+      │                       └──► exits 0/1
+      │
+      ├─ Stage 5: Helm Deploy (dev)    helm-agent pod (Node 2)
+      │               └──► helm upgrade --install → dev namespace
+      │                       └──► app pod pulls image from ACR
+      │
+      ├─ Stage 6: Smoke Test           nodejs-agent pod (Node 2)
+      │               └──► curl http://platform-sample-app.dev.svc.cluster.local:3000/health
+      │
+      ├─ Stage 7: Service Bus Notify   nodejs-agent pod (Node 2)
+      │               └──► POST build-events queue (REST + HMAC-SHA256 SAS token)
+      │
+      ├─ Stage 8: Approval Gate        Jenkins controller (no agent pod)
+      │               └──► input() — waits for admin click in Jenkins UI
+      │               └──► only executes when branch == main
+      │
+      └─ Stage 9: Helm Promote         helm-agent pod (Node 2)
+                      └──► helm upgrade --install → staging namespace
+                              └──► same image tag as Stage 5
+```
+
+---
+
+## Secret distribution chain
+
+```
+Terraform (random_password) ──► Azure Key Vault
+                                      │
+                     terraform/k8s-post/ reads secrets from Key Vault
+                                      │
+                    ┌─────────────────┼──────────────────────┐
+                    │                 │                      │
+          acr-pull-secret      jenkins-admin-          jenkins-pipeline-creds
+          (dockerconfigjson)   credentials             (flat key-value)
+          jenkins + dev +      jenkins ns              jenkins ns
+          staging ns           │                       ├── ACR_USERNAME
+                               │                       ├── ACR_PASSWORD
+                               │                       ├── ACR_LOGIN_SERVER
+                               │                       ├── POSTGRESQL_CONNECTION_STRING
+                               │                       ├── RESOURCE_GROUP_NAME
+                               │                       └── ACI_NAME
+                               │
+                  Helm values.yaml containerEnv
+                  (secretKeyRef per-key)
+                               │
+                  Jenkins controller pod env vars
+                               │
+                  JCasC ${VAR_NAME} interpolation (credentials.yaml)
+                               │
+                  Jenkinsfile withCredentials{} / env {}
+```
+
+---
+
+## Ingress routing
+
+```
+External request (from laptop, via /etc/hosts or DNS)
+      │
+      ▼
+NGINX Ingress Controller  (Node 1, Azure LoadBalancer external IP)
+      │
+      ├─ jenkins.platform.internal  ──►  jenkins:8080 (jenkins ns)
+      ├─ app.dev.platform.internal  ──►  platform-sample-app:3000 (dev ns)
+      └─ app.staging.platform.internal ► platform-sample-app:3000 (staging ns)
+
+Internal cluster DNS (CoreDNS):
+  platform.internal queries ──► 168.63.129.16 (Azure internal resolver)
+  Azure resolver answers from Private DNS Zone (platform.internal)
+  Private DNS Zone is linked to the AKS VNet by terraform/modules/dns/
+```
+
+---
+
+## RBAC layers
+
+### Jenkins authorization (JCasC Matrix Strategy)
 
 | Role | Permissions |
 |---|---|
-| `admin` | Full: configure, manage, build, delete, administer |
-| `developer` | Build, cancel, read, workspace, viewStatus on assigned jobs |
-| `viewer` | Read + viewStatus only (cannot trigger builds) |
+| `admin` | Hudson.Administer — full access |
+| `developer` | Build, Cancel, Read, Workspace, ViewStatus on jobs |
+| `viewer` | Read + ViewStatus only |
 
-### Kubernetes RBAC (replaces Azure IAM)
+### Kubernetes RBAC
 
 | Subject | Scope | Permissions |
 |---|---|---|
-| `jenkins-sa` (ServiceAccount) | ClusterRole | `pods/exec`, `pods/log`, pods CRUD — required by the Jenkins Kubernetes plugin to launch agents |
-| `dev-developer-role` | Role in `dev` ns | deployments + services + pods CRUD + rollback |
-| `dev-viewer-role` | Role in `dev` ns | get / list / watch only |
-
----
-
-## 4. Secrets flow (no CSI driver)
-
-```
-Key Vault secret ──(Terraform data source reads value)──▶ kubernetes_secret in AKS
-                                                            │
-                                            mounted as env/volume by workloads
-```
-
-Because the CSI Secret Store driver cannot be installed, Terraform reads each Key Vault
-secret and materializes it as a native `kubernetes_secret`. Secrets are **never** echoed
-into Terraform outputs (all marked `sensitive = true`) and **never** committed.
-
-ACR authentication follows the same constraint-driven pattern: instead of granting the
-kubelet identity the `AcrPull` role, ACR runs with `admin_enabled=true` and its
-credentials become a Kubernetes `imagePullSecret`.
-
----
-
-## 5. CI/CD data flow
-
-```
-GitHub PR
-   │
-   ▼
-GitHub Actions  ──  terraform fmt / validate / plan  (gate on infra changes)
-   │
-   ▼
-Jenkins Multibranch pipeline detects the branch
-   │
-   ├─ Stage 1  Checkout + Lint            [nodejs-agent pod · Node 2]
-   ├─ Stage 2  Unit Tests                 [nodejs-agent pod]
-   ├─ Stage 3  Docker Build + Push → ACR  [nodejs-agent pod]
-   ├─ Stage 4  DB Migration via ACI       [Container Instance · one-shot]
-   ├─ Stage 5  Helm Deploy → dev ns       [helm-agent pod]
-   ├─ Stage 6  Smoke Test                 [nodejs-agent pod]
-   ├─ Stage 7  Service Bus Notify         [any agent]
-   ├─ Stage 8  input() approval gate      [human]
-   └─ Stage 9  Helm Promote → staging     [helm-agent pod]
-```
-
-Each agent is an **ephemeral pod** created on demand by the Jenkins Kubernetes plugin
-and destroyed when the stage completes — the controller itself runs **zero executors**.
-
----
-
-See [`decisions.md`](decisions.md) for *why* each of these choices was made, and
-[`runbook.md`](runbook.md) for how to operate the platform.
+| `jenkins-sa` (ServiceAccount) | ClusterRole | pods CRUD, pods/exec, pods/log (for K8s cloud plugin) |
+| `dev-developer` (Group) | Role in `dev` ns | deployments + services + pods CRUD + rollback |
+| `dev-viewer` (Group) | Role in `dev` ns | get/list/watch only |

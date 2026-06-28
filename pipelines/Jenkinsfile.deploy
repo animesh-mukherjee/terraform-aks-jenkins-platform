@@ -1,0 +1,188 @@
+// =============================================================================
+// pipelines/Jenkinsfile.deploy
+//
+// Standalone deploy pipeline — deploys a pre-existing ACR image to a
+// named environment without running CI (lint, tests, Docker build).
+//
+// Use cases:
+//   - Deploy a specific commit SHA to dev for manual QA
+//   - Re-deploy the same image after config-only changes (Helm values change)
+//   - Emergency deploy of a known-good image bypassing the main pipeline
+//   - Rollback: set IMAGE_TAG to a previously passing commit SHA
+//
+// How to trigger:
+//   Jenkins UI → platform-sample-app → Build with Parameters
+//   OR via REST API:
+//     curl -X POST "http://jenkins.platform.internal/job/platform-deploy/buildWithParameters" \
+//       --user admin:$ADMIN_PASSWORD \
+//       --data "IMAGE_TAG=abc12345&ENVIRONMENT=dev"
+//
+// This Jenkinsfile is separate from Jenkinsfile.build to keep the main CI/CD
+// pipeline clean. It is not associated with the Multibranch Pipeline job —
+// create it as a standalone Pipeline job pointing to this file.
+// =============================================================================
+
+pipeline {
+  agent none
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    timeout(time: 30, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    ansiColor('xterm')
+    timestamps()
+  }
+
+  // ── Parameters ───────────────────────────────────────────────────────────
+  // Parameters are shown in the Jenkins UI when "Build with Parameters" is
+  // clicked. The defaults are safe (latest tag, dev environment).
+  parameters {
+    string(
+      name:         'IMAGE_TAG',
+      defaultValue: 'latest',
+      description:  'ACR image tag to deploy. Use the 8-char git SHA for ' +
+                    'traceability (e.g. "abc12345") or "latest" for the most recent build.'
+    )
+    choice(
+      name:    'ENVIRONMENT',
+      choices: ['dev', 'staging'],
+      description: 'Target Kubernetes namespace. Staging requires admin approval ' +
+                   'when triggered from the main pipeline; this job bypasses that gate.'
+    )
+    booleanParam(
+      name:         'RUN_SMOKE_TEST',
+      defaultValue: true,
+      description:  'Run an HTTP health check after deploy. Uncheck to skip ' +
+                    '(useful when deploying a backend service with no HTTP health endpoint).'
+    )
+  }
+
+  environment {
+    APP_NAME = 'platform-sample-app'
+  }
+
+  stages {
+
+    // ── Validate parameters ────────────────────────────────────────────────
+    stage('Validate') {
+      agent {
+        kubernetes {
+          label 'helm'
+          defaultContainer 'helm'
+        }
+      }
+      steps {
+        container('helm') {
+          withCredentials([
+            string(credentialsId: 'acr-login-server', variable: 'ACR_SERVER')
+          ]) {
+            sh label: 'Check image exists in ACR', script: '''
+              echo "Verifying ${ACR_SERVER}/${APP_NAME}:${IMAGE_TAG} exists in ACR..."
+              az acr repository show-tags \
+                --name         "$(echo $ACR_SERVER | cut -d. -f1)" \
+                --repository   "$APP_NAME" \
+                --query        "[?@ == '${IMAGE_TAG}']" \
+                --output       tsv | grep -q "${IMAGE_TAG}" || {
+                  echo "ERROR: Image tag '${IMAGE_TAG}' not found in ACR."
+                  echo "Available tags:"
+                  az acr repository show-tags \
+                    --name       "$(echo $ACR_SERVER | cut -d. -f1)" \
+                    --repository "$APP_NAME" \
+                    --output     table
+                  exit 1
+                }
+              echo "Image ${IMAGE_TAG} confirmed in ACR."
+            '''
+          }
+        }
+      }
+    }
+
+    // ── Deploy ────────────────────────────────────────────────────────────
+    stage('Deploy') {
+      agent {
+        kubernetes {
+          label 'helm'
+          defaultContainer 'helm'
+        }
+      }
+      steps {
+        checkout scm
+        container('helm') {
+          withCredentials([
+            string(credentialsId: 'acr-login-server', variable: 'ACR_SERVER')
+          ]) {
+            sh label: "Helm deploy ${params.IMAGE_TAG} → ${params.ENVIRONMENT}", script: '''
+              INGRESS_HOST="app.${ENVIRONMENT}.platform.internal"
+
+              helm upgrade --install "${APP_NAME}" \
+                app-sample/helm/app-chart/ \
+                --namespace      "${ENVIRONMENT}" \
+                --set            image.repository="${ACR_SERVER}/${APP_NAME}" \
+                --set            image.tag="${IMAGE_TAG}" \
+                --set            image.pullPolicy=IfNotPresent \
+                --set            ingress.host="${INGRESS_HOST}" \
+                --values         app-sample/helm/app-chart/values.yaml \
+                --wait \
+                --timeout        5m \
+                --atomic
+
+              echo "Deployed ${APP_NAME}:${IMAGE_TAG} to namespace '${ENVIRONMENT}'"
+              echo "Ingress: http://${INGRESS_HOST}"
+            '''
+          }
+        }
+      }
+    }
+
+    // ── Smoke Test (optional) ─────────────────────────────────────────────
+    stage('Smoke Test') {
+      when {
+        expression { return params.RUN_SMOKE_TEST }
+        beforeAgent true
+      }
+      agent {
+        kubernetes {
+          label 'nodejs'
+          defaultContainer 'nodejs'
+        }
+      }
+      steps {
+        container('nodejs') {
+          sh label: 'HTTP health check', script: '''
+            set -euo pipefail
+            MAX=12
+            DELAY=5
+            for i in $(seq 1 $MAX); do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                "http://${APP_NAME}.${ENVIRONMENT}.svc.cluster.local:3000/health" \
+                --max-time 5 2>/dev/null || echo "000")
+              if [ "$STATUS" = "200" ]; then
+                echo "Smoke test PASSED (HTTP 200) on attempt $i"
+                exit 0
+              fi
+              echo "Attempt $i/$MAX — HTTP $STATUS, retrying in ${DELAY}s..."
+              sleep $DELAY
+            done
+            echo "Smoke test FAILED after $MAX attempts."
+            exit 1
+          '''
+        }
+      }
+    }
+
+  } // end stages
+
+  post {
+    success {
+      echo "Deploy complete: ${APP_NAME}:${params.IMAGE_TAG} → ${params.ENVIRONMENT}"
+    }
+    failure {
+      echo "Deploy FAILED: ${APP_NAME}:${params.IMAGE_TAG} → ${params.ENVIRONMENT}"
+    }
+    always {
+      cleanWs()
+    }
+  }
+
+}

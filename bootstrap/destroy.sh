@@ -57,7 +57,6 @@ phase0_preflight() {
   [[ -n "${RESOURCE_GROUP}" && "${RESOURCE_GROUP}" != "null" ]] || die "Could not find the KodeKloud resource group. Set RESOURCE_GROUP=<name> and re-run."
   ok "subscription=${SUBSCRIPTION_ID} resource_group=${RESOURCE_GROUP}"
 
-  export TF_VAR_subscription_id="${SUBSCRIPTION_ID}"
   export TF_VAR_resource_group_name="${RESOURCE_GROUP}"
   export TF_VAR_prefix="${PREFIX}"
   export TF_VAR_location="${LOCATION}"

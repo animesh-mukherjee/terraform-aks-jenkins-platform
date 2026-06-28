@@ -91,7 +91,6 @@ phase0_preflight() {
 
   # Export as TF_VAR_* so every module's variables pick these up automatically.
   # (TF_VAR_foo is Terraform's convention for setting var.foo from the environment.)
-  export TF_VAR_subscription_id="${SUBSCRIPTION_ID}"
   export TF_VAR_resource_group_name="${RESOURCE_GROUP}"
   export TF_VAR_prefix="${PREFIX}"
   export TF_VAR_location="${LOCATION}"
@@ -191,6 +190,46 @@ phase4_kubeconfig() {
 }
 
 # ---------------------------------------------------------------------------
+# Phase 5 — Apply terraform/k8s-post/ (K8s Secrets, namespaces, node taint)
+# ---------------------------------------------------------------------------
+# This MUST run after Phase 4 (kubeconfig written) because the kubernetes
+# provider in k8s-post/ uses ~/.kube/config to authenticate to AKS.
+# Resources created here:
+#   - Namespaces: jenkins, dev, staging
+#   - CoreDNS custom ConfigMap + rolling restart
+#   - imagePullSecrets (ACR) in all three namespaces
+#   - jenkins-admin-credentials K8s Secret
+#   - app-db-credentials K8s Secret (dev + staging)
+#   - app-config-credentials K8s Secret (dev + staging)
+#   - jenkins-pipeline-creds K8s Secret
+#   - service-bus-credentials K8s Secret
+#   - Node 1 taint: dedicated=controller:NoSchedule
+#   - Node 2 label: dedicated=agent
+phase5_k8s_post() {
+  log "Phase 5: applying terraform/k8s-post/ (namespaces, K8s secrets, node placement)"
+  local k8s_post_dir="${REPO_ROOT}/terraform/k8s-post"
+
+  # k8s-post/ uses the SAME storage account as the root but a different blob
+  # key (k8s-post.tfstate). Pass the same -backend-config flags used in Phase 2.
+  terraform -chdir="${k8s_post_dir}" init \
+    -input=false \
+    -reconfigure \
+    -backend-config="resource_group_name=${RESOURCE_GROUP}" \
+    -backend-config="storage_account_name=${STATE_SA}"
+
+  # k8s-post/ needs resource_group_name and storage_account_name as input
+  # variables so it can configure the terraform_remote_state data source that
+  # reads the root module's outputs.
+  terraform -chdir="${k8s_post_dir}" apply \
+    -input=false \
+    -auto-approve \
+    -var="resource_group_name=${RESOURCE_GROUP}" \
+    -var="storage_account_name=${STATE_SA}"
+
+  ok "k8s-post complete — namespaces, secrets, and node placement applied"
+}
+
+# ---------------------------------------------------------------------------
 # Safety net: if anything fails mid-run, make sure backend.tf is restored so the
 # working tree is never left in the "parked" state.
 # ---------------------------------------------------------------------------
@@ -212,9 +251,12 @@ main() {
   phase2_migrate
   phase3_full_apply
   phase4_kubeconfig
+  phase5_k8s_post
   trap - EXIT   # success: clear the safety-net trap (backend.tf already restored in Phase 2)
-  ok "BOOTSTRAP COMPLETE — platform is up. Run 'kubectl get pods -A' to explore."
-  log "When you are done for the session, run: bootstrap/destroy.sh"
+  ok "BOOTSTRAP COMPLETE — platform is up."
+  log "Next: helm upgrade --install jenkins jenkins/jenkins --namespace jenkins --values helm/jenkins/values.yaml --wait"
+  log "Then: kubectl apply -k k8s/rbac/ && kubectl apply -k jenkins/casc/"
+  log "When done for the session, run: bootstrap/destroy.sh"
 }
 
 main "$@"

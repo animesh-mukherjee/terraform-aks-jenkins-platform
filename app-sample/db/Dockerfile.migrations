@@ -1,0 +1,32 @@
+# =============================================================================
+# app-sample/db/Dockerfile.migrations
+#
+# Minimal Node.js image for the DB migration runner.
+# Built by Jenkinsfile.build Stage 3 alongside the app image:
+#   docker build --file app-sample/db/Dockerfile.migrations app-sample/
+#
+# Pushed to ACR as:
+#   <acr>.azurecr.io/platform-sample-app-migrations:<commit-sha>
+#
+# Run by Jenkinsfile.build Stage 4 inside the Azure Container Instance
+# (terraform/modules/aci/) with restart_policy=Never.
+# =============================================================================
+
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Install only the pg dependency — no dev deps, no app code.
+COPY db/package.json ./
+RUN npm install --production --no-audit
+
+# Copy migration runner and SQL files.
+COPY db/migrate.js     ./migrate.js
+COPY db/migrations/    ./migrations/
+
+# Run as non-root.
+USER node
+
+# migrate.js exits 0 on success, 1 on failure.
+# ACI checks the exit code in Stage 4 to determine if the pipeline continues.
+CMD ["node", "migrate.js"]

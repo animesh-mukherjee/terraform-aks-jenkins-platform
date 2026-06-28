@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  # Name must match the configMapRef in deployment.yaml's envFrom block.
+  name: {{ include "app-chart.fullname" . }}-config
+  labels:
+    {{- include "app-chart.labels" . | nindent 4 }}
+data:
+  # ── App runtime config ──────────────────────────────────────────────────────
+  APP_ENVIRONMENT:      {{ .Values.appConfig.environment      | quote }}
+  LOG_LEVEL:            {{ .Values.appConfig.logLevel         | quote }}
+  DB_MAX_CONNECTIONS:   {{ .Values.appConfig.maxDbConnections | quote }}
+
+  # ── Feature flags ───────────────────────────────────────────────────────────
+  # Read by src/routes/config.js → GET /api/config.
+  # Override at deploy time with: --set featureFlags.darkMode=true
+  FEATURE_DARK_MODE:     {{ .Values.featureFlags.darkMode    | toString | quote }}
+  FEATURE_NEW_USER_FLOW: {{ .Values.featureFlags.newUserFlow | toString | quote }}

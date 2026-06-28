@@ -1,0 +1,191 @@
+// =============================================================================
+// pipelines/Jenkinsfile.promote
+//
+// Promotion pipeline — promotes a specific image tag from dev to staging
+// with an explicit human approval step.
+//
+// Use cases:
+//   - Promote a hotfix that bypassed the main pipeline
+//   - Re-promote a previously promoted tag (e.g. after a staging issue was fixed)
+//   - Manual governance: a release manager controls what goes to staging
+//     independently of the CI/CD pipeline
+//
+// Difference from Jenkinsfile.build Stage 9:
+//   - Jenkinsfile.build Stage 9 promotes the image just built (latest commit)
+//   - This pipeline promotes ANY image tag already in ACR
+//   - The approval gate here always runs (no `when { branch 'main' }` guard)
+//
+// Trigger: manually — Jenkins UI → Build with Parameters
+// =============================================================================
+
+pipeline {
+  agent none
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    timeout(time: 60, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    ansiColor('xterm')
+    timestamps()
+  }
+
+  parameters {
+    string(
+      name:         'IMAGE_TAG',
+      defaultValue: '',
+      description:  'REQUIRED — image tag to promote to staging. ' +
+                    'Must be a tag that already exists in ACR and has been ' +
+                    'successfully deployed to dev (check dev smoke test).'
+    )
+  }
+
+  environment {
+    APP_NAME = 'platform-sample-app'
+  }
+
+  stages {
+
+    // ── Pre-flight checks ──────────────────────────────────────────────────
+    stage('Pre-flight') {
+      agent {
+        kubernetes {
+          label 'helm'
+          defaultContainer 'helm'
+        }
+      }
+      steps {
+        container('helm') {
+          withCredentials([
+            string(credentialsId: 'acr-login-server', variable: 'ACR_SERVER')
+          ]) {
+            sh label: 'Validate IMAGE_TAG parameter', script: '''
+              if [ -z "${IMAGE_TAG}" ]; then
+                echo "ERROR: IMAGE_TAG parameter is required."
+                exit 1
+              fi
+            '''
+            sh label: 'Verify image exists in ACR', script: '''
+              echo "Checking ACR for ${APP_NAME}:${IMAGE_TAG}..."
+              az acr repository show-tags \
+                --name       "$(echo $ACR_SERVER | cut -d. -f1)" \
+                --repository "$APP_NAME" \
+                --output     tsv | grep -q "^${IMAGE_TAG}$" || {
+                  echo "ERROR: Tag '${IMAGE_TAG}' not found in ACR."
+                  echo "Run the main pipeline first (Jenkinsfile.build) to build this tag."
+                  exit 1
+                }
+              echo "Confirmed: ${APP_NAME}:${IMAGE_TAG} exists in ACR."
+            '''
+            sh label: 'Verify dev deployment is healthy', script: '''
+              # Check that the same image tag is currently running in dev.
+              # Promoting an image that is NOT running in dev is a red flag.
+              DEPLOYED_TAG=$(helm get values "${APP_NAME}" \
+                --namespace dev \
+                --output    json \
+                2>/dev/null | grep -o '"tag":"[^"]*"' | cut -d'"' -f4 || echo "")
+
+              if [ "$DEPLOYED_TAG" != "$IMAGE_TAG" ]; then
+                echo "WARNING: dev is running tag '${DEPLOYED_TAG}', not '${IMAGE_TAG}'."
+                echo "Promoting a tag that has not been validated in dev."
+                echo "Proceeding anyway — the approver accepts this risk."
+              else
+                echo "Confirmed: dev is running ${IMAGE_TAG} (validated)."
+              fi
+            '''
+          }
+        }
+      }
+    }
+
+    // ── Approval ───────────────────────────────────────────────────────────
+    // Always present in this pipeline — unlike the main pipeline where the
+    // gate only appears on `main` branch.
+    stage('Approval') {
+      agent none
+      steps {
+        timeout(time: 30, unit: 'MINUTES') {
+          input(
+            message:              "Promote ${env.APP_NAME}:${params.IMAGE_TAG} to staging?",
+            ok:                   'Promote',
+            submitter:            'admin',
+            submitterParameter:   'APPROVED_BY'
+          )
+        }
+      }
+    }
+
+    // ── Promote to staging ─────────────────────────────────────────────────
+    stage('Promote → staging') {
+      agent {
+        kubernetes {
+          label 'helm'
+          defaultContainer 'helm'
+        }
+      }
+      steps {
+        checkout scm
+        container('helm') {
+          withCredentials([
+            string(credentialsId: 'acr-login-server', variable: 'ACR_SERVER')
+          ]) {
+            sh label: 'Helm upgrade → staging', script: '''
+              helm upgrade --install "${APP_NAME}" \
+                app-sample/helm/app-chart/ \
+                --namespace      staging \
+                --set            image.repository="${ACR_SERVER}/${APP_NAME}" \
+                --set            image.tag="${IMAGE_TAG}" \
+                --set            image.pullPolicy=IfNotPresent \
+                --set            ingress.host="app.staging.platform.internal" \
+                --values         app-sample/helm/app-chart/values.yaml \
+                --wait \
+                --timeout        5m \
+                --atomic
+            '''
+          }
+        }
+      }
+      post {
+        success {
+          echo "Promoted ${APP_NAME}:${params.IMAGE_TAG} to staging. Approved by: ${env.APPROVED_BY}"
+        }
+      }
+    }
+
+    // ── Post-promote smoke test ────────────────────────────────────────────
+    stage('Staging Smoke Test') {
+      agent {
+        kubernetes {
+          label 'nodejs'
+          defaultContainer 'nodejs'
+        }
+      }
+      steps {
+        container('nodejs') {
+          sh label: 'Staging health check', script: '''
+            set -euo pipefail
+            MAX=12
+            for i in $(seq 1 $MAX); do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                "http://${APP_NAME}.staging.svc.cluster.local:3000/health" \
+                --max-time 5 2>/dev/null || echo "000")
+              [ "$STATUS" = "200" ] && echo "Staging smoke test PASSED" && exit 0
+              echo "Attempt $i/$MAX — HTTP $STATUS..."
+              sleep 5
+            done
+            echo "Staging smoke test FAILED after $MAX attempts."
+            exit 1
+          '''
+        }
+      }
+    }
+
+  } // end stages
+
+  post {
+    always { cleanWs() }
+    failure {
+      echo "Promotion FAILED: ${env.APP_NAME}:${params.IMAGE_TAG} → staging"
+    }
+  }
+
+}
